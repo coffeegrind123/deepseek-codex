@@ -68,6 +68,31 @@ idle, with an optional token budget:
 The status line reports `Goal paused / stalled / hit usage limits (/goal resume)` when it
 needs you. Cap budgets with `goals.max_goal_token_budget` in `config.toml`.
 
+#### Usage limits do not pause goals here
+
+z.ai's GLM Coding Plan has a 5-hour usage window. When it is exhausted, z.ai answers with
+a `response.failed` / `rate_limit_exceeded` event carrying the reset time; stock Codex
+turns that into "Usage limit reached", stops the turn and parks the goal as
+`UsageLimited` until you type `/goal resume` — there is no built-in auto-resume
+([openai/codex#28931](https://github.com/openai/codex/issues/28931), open).
+
+The router removes the pause instead of automating the resume. `routes.json` enables
+`usageLimit` for the z.ai route: the router sniffs the first SSE event of every reply,
+and when it is the usage-limit failure it does not forward it. It keeps Codex's stream
+open with a `router.hold` heartbeat event every 10 s (Codex's idle timer counts parsed
+events, not bytes, so a comment line would not do), waits until the reset time plus 5 s
+(z.ai prints it in Asia/Shanghai time; `resetTzOffsetMinutes = 480`), then re-sends the
+identical request and streams the real answer into the same turn. Codex never sees an
+error, so the goal stays `Active` and the turn resumes exactly where it stopped — no
+re-reading of context. If the reset time is missing or already past it retries on a
+30 s → 5 min backoff; after `maxHoldMs` (6 h) it gives up and forwards the failure, at
+which point the goal pauses as before. A hold is visible in `./codex-router status`
+(`holds`) and in the log as `event="hold"`. Nothing else changes: the goal's own token
+budget, `/goal pause` and completion still stop it.
+
+Verified with a mock z.ai that rate-limits first: Codex, configured with a 20 s idle
+timeout, stayed on one stream through an 85 s hold and finished the turn.
+
 ### Other useful commands
 
 ```sh
@@ -116,7 +141,7 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
 | `.codex/secrets.env` | API keys + router token, mode 600, git-ignored |
 | `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re` |
-| `router/routes.json` | model prefix → upstream table |
+| `router/routes.json` | model prefix → upstream table, per-route `usageLimit` hold policy |
 | `setup.sh` | reproduce on a fresh clone; `--check` verifies |
 
 Machine-specific paths that `setup.sh` does not manage: the `ghidra` MCP launcher

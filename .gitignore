@@ -20,3 +20,10 @@ sandbox-test/
 .codex/models_cache.json
 .codex/*.lock
 .codex/thread-writer-locks/
+
+# Unrelated work that shares this folder — never part of the workspace repo.
+/.tmp/
+/Elytra/
+/ElytraRE/
+/tools/
+/vulnresearch/

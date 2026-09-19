@@ -39,6 +39,20 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 // stream_idle_timeout_ms; this only guards against half-open sockets it cannot see.
 const DEFAULT_UPSTREAM_IDLE_MS = 600_000;
 const SOFT_ERROR_CAPTURE_BYTES = 1024 * 1024;
+// First-event sniff window: a usage-limit failure is a few hundred bytes; real output
+// starts with `response.created`, which is far smaller than this.
+const SNIFF_MAX_BYTES = 16 * 1024;
+const DEFAULT_USAGE_LIMIT = {
+  enabled: false,
+  // z.ai prints the reset time in Asia/Shanghai local time with no zone marker.
+  resetTzOffsetMinutes: 480,
+  maxHoldMs: 6 * 60 * 60 * 1000,
+  pollMs: 5 * 60 * 1000,
+  heartbeatMs: 10 * 1000,
+  // When the reset time is unknown or already past, retry on a doubling backoff capped at pollMs.
+  retryBaseMs: 30 * 1000,
+  resetSlackMs: 5 * 1000,
+};
 const HEALTH_PATH = '/health';
 const ROUTES_PATH = '/routes';
 // Hop-by-hop headers must not be forwarded (RFC 9110 §7.6.1); the rest are rewritten.
@@ -83,6 +97,9 @@ function loadRoutes() {
       // Optional per-upstream request rewrites, applied to the parsed JSON body.
       drop: Array.isArray(route.dropFields) ? route.dropFields : [],
       set: typeof route.setFields === 'object' && route.setFields !== null ? route.setFields : {},
+      // Optional: swallow "usage limit reached" failures and retry after the window resets,
+      // keeping Codex's stream open with SSE comments so a running goal never pauses.
+      usageLimit: { ...DEFAULT_USAGE_LIMIT, ...(route.usageLimit ?? {}) },
     };
   });
 }
@@ -196,6 +213,59 @@ function applyRewrites(route, body) {
   return Buffer.from(JSON.stringify(body));
 }
 
+/**
+ * Recognise z.ai's 5-hour-window exhaustion in the first SSE event:
+ *   event: response.failed
+ *   data: {"response":{"error":{"code":"rate_limit_exceeded","message":"Usage limit reached
+ *          for 5 hour. Your limit will reset at 2026-09-20 10:10:23[...]"}, ...}}
+ * Returns { resetAt: epoch ms | null, message } or null when the event is something else.
+ */
+export function parseUsageLimitEvent(eventText, policy = DEFAULT_USAGE_LIMIT) {
+  const dataLine = eventText.split('\n').find((line) => line.startsWith('data:'));
+  if (!dataLine) {
+    return null;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(dataLine.slice(5).trim());
+  } catch {
+    return null;
+  }
+  const error = payload?.response?.error ?? payload?.error ?? (payload?.type === 'error' ? payload : null);
+  const code = error?.code ?? error?.type;
+  if (code !== 'rate_limit_exceeded' && code !== 'usage_limit_reached') {
+    return null;
+  }
+  const message = String(error?.message ?? 'usage limit reached');
+  const match = message.match(/reset at (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+  let resetAt = null;
+  if (match) {
+    const [, y, mo, d, h, mi, s] = match.map(Number);
+    resetAt = Date.UTC(y, mo - 1, d, h, mi, s) - policy.resetTzOffsetMinutes * 60 * 1000;
+  }
+  return { resetAt, message };
+}
+
+/**
+ * Keep Codex's stream alive until the deadline. Codex's stream_idle_timeout_ms counts
+ * time between parsed SSE *events* (codex-api/src/sse/responses.rs), so comment lines do
+ * not help; send a real event with an unknown `type`, which Codex logs and ignores.
+ */
+function heartbeat(res, waitMs, everyMs, until, cancelled) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + waitMs;
+    const tick = () => {
+      if (cancelled() || Date.now() >= deadline) {
+        resolve();
+        return;
+      }
+      res.write(`event: router.hold\ndata: ${JSON.stringify({ type: 'router.hold', until })}\n\n`);
+      setTimeout(tick, Math.min(everyMs, Math.max(0, deadline - Date.now())));
+    };
+    tick();
+  });
+}
+
 /** Map an upstream 200-with-error body to an HTTP status Codex can act on. */
 function classifySoftError(text) {
   let parsed = null;
@@ -226,12 +296,13 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
   const startedAt = nowIso();
   let inFlight = 0;
   let served = 0;
+  const holds = new Map();
 
   async function handle(req, res) {
     const requestUrl = new URL(req.url, 'http://router.invalid');
 
     if (req.method === 'GET' && requestUrl.pathname === HEALTH_PATH) {
-      sendJson(res, HTTP_OK, { ok: true, startedAt, inFlight, served, pid: process.pid });
+      sendJson(res, HTTP_OK, { ok: true, startedAt, inFlight, served, pid: process.pid, holds: [...holds.values()] });
       return;
     }
 
@@ -303,16 +374,14 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
     const target = upstreamUrl(route.base, req.url);
     const stream = body.stream === true;
     const started = Date.now();
-    inFlight += 1;
-
     const transport = target.protocol === 'https:' ? https : http;
-    const upstream = transport.request(target, {
-      method: 'POST',
-      headers: forwardHeaders(req, apiKey, outgoingBody.length),
-    });
+    const requestHeaders = forwardHeaders(req, apiKey, outgoingBody.length);
+    inFlight += 1;
 
     let bytesOut = 0;
     let finished = false;
+    let attempts = 0;
+    let heldMs = 0;
     const finish = (fields) => {
       if (finished) {
         return;
@@ -322,98 +391,216 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
       served += 1;
       logger.line({
         event: 'proxy', model, route: route.name, path: target.pathname, stream,
-        ms: Date.now() - started, reqBytes: outgoingBody.length, resBytes: bytesOut, ...fields,
+        ms: Date.now() - started, reqBytes: outgoingBody.length, resBytes: bytesOut,
+        ...(attempts > 1 ? { attempts, heldMs } : {}), ...fields,
       });
     };
 
-    upstream.setTimeout(idleMs, () => {
-      upstream.destroy(Object.assign(new Error(`upstream idle for ${idleMs} ms`), { code: 'ROUTER_IDLE' }));
-    });
-
-    upstream.on('response', (up) => {
-      // z.ai answers some failures (bad key, quota) with HTTP 200 and a JSON body such as
-      // {"code":401,"msg":"token expired or incorrect","success":false}. Codex asked for
-      // SSE, so a non-SSE 200 is always an error; surface it with a real status so the
-      // CLI shows the upstream message instead of a stream parse failure.
-      const contentType = String(up.headers['content-type'] ?? '');
-      if (stream && up.statusCode === HTTP_OK && !contentType.startsWith('text/event-stream')) {
-        const chunks = [];
-        let size = 0;
-        up.on('data', (chunk) => {
-          if (size < SOFT_ERROR_CAPTURE_BYTES) {
-            chunks.push(chunk);
-            size += chunk.length;
-          }
-        });
-        up.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          const { status, message } = classifySoftError(text);
-          bytesOut = size;
-          finish({ status, softError: true, upstreamError: text.slice(0, 2048) });
-          sendError(res, status, 'router_upstream_soft_error', `${route.name}: ${message}`);
-        });
-        up.on('error', (err) => {
-          finish({ status: HTTP_BAD_GATEWAY, error: `upstream body: ${err.message}` });
-          sendError(res, HTTP_BAD_GATEWAY, 'router_upstream_error', err.message);
-        });
-        return;
-      }
-
-      const headers = {};
-      for (const [name, value] of Object.entries(up.headers)) {
-        if (!DROPPED_RESPONSE_HEADERS.has(name.toLowerCase())) {
-          headers[name] = value;
-        }
-      }
-      res.writeHead(up.statusCode, headers);
-
-      // Keep the first bytes of an upstream error so the log carries evidence, not a verdict.
-      const errorHead = [];
-      let errorHeadBytes = 0;
-      up.on('data', (chunk) => {
-        bytesOut += chunk.length;
-        if (up.statusCode >= 400 && errorHeadBytes < 2048) {
-          errorHead.push(chunk.subarray(0, 2048 - errorHeadBytes));
-          errorHeadBytes += chunk.length;
-        }
-        upstream.setTimeout(idleMs);
-      });
-      up.on('end', () => {
-        const fields = { status: up.statusCode };
-        if (up.statusCode >= 400) {
-          fields.upstreamError = Buffer.concat(errorHead).toString('utf8');
-        }
-        finish(fields);
-      });
-      up.on('error', (err) => finish({ status: up.statusCode, error: `upstream body: ${err.message}` }));
-      // A client abort mid-stream tears the upstream down without 'end' or 'error'; 'close'
-      // always fires, so it is the accounting backstop.
-      up.on('close', () => finish({ status: up.statusCode, error: 'stream closed before end' }));
-      up.pipe(res);
-    });
-
-    upstream.on('error', (err) => {
-      const timedOut = err.code === 'ROUTER_IDLE';
-      finish({ status: timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, error: err.message });
-      if (!res.headersSent) {
-        sendError(res, timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, 'router_upstream_error',
-          `${route.name} (${target.host}): ${err.message}`);
-      } else {
-        res.destroy();
-      }
-    });
-
+    let clientGone = false;
+    let activeUpstream = null;
+    let upstreamStatus = null;
     // Codex aborting (interrupt, retry) must release the upstream connection too. `res`
     // 'close' is the reliable signal: once the body has been consumed, `req` may stay
     // silent, and a paused pipe into a dead socket never reaches 'end' on the upstream.
     res.on('close', () => {
+      clientGone = true;
       if (!finished) {
-        upstream.destroy(new Error('client closed'));
-        finish({ status: HTTP_BAD_GATEWAY, error: 'client closed before upstream finished' });
+        activeUpstream?.destroy(new Error('client closed'));
+        finish({ status: upstreamStatus ?? HTTP_BAD_GATEWAY, error: 'client closed before upstream finished' });
       }
     });
 
-    upstream.end(outgoingBody);
+    /**
+     * One upstream attempt. Resolves to:
+     *   { kind: 'done' }                       body delivered (or error already sent)
+     *   { kind: 'usage-limit', resetAt, message }  z.ai window exhausted; nothing sent yet
+     * The first SSE event is sniffed before anything reaches Codex, so a usage-limit
+     * failure can be swallowed and retried after the window resets.
+     */
+    const attemptUpstream = () => new Promise((resolve) => {
+      attempts += 1;
+      const upstream = transport.request(target, { method: 'POST', headers: requestHeaders });
+      activeUpstream = upstream;
+
+      upstream.setTimeout(idleMs, () => {
+        upstream.destroy(Object.assign(new Error(`upstream idle for ${idleMs} ms`), { code: 'ROUTER_IDLE' }));
+      });
+
+      upstream.on('response', (up) => {
+        upstreamStatus = up.statusCode;
+        const contentType = String(up.headers['content-type'] ?? '');
+        const isSse = contentType.startsWith('text/event-stream');
+
+        // z.ai answers some failures (bad key, quota) with HTTP 200 and a JSON body such as
+        // {"code":401,"msg":"token expired or incorrect","success":false}. Codex asked for
+        // SSE, so a non-SSE 200 is always an error; surface it with a real status so the
+        // CLI shows the upstream message instead of a stream parse failure.
+        if (stream && up.statusCode === HTTP_OK && !isSse) {
+          const chunks = [];
+          let size = 0;
+          up.on('data', (chunk) => {
+            if (size < SOFT_ERROR_CAPTURE_BYTES) {
+              chunks.push(chunk);
+              size += chunk.length;
+            }
+          });
+          up.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            const { status, message } = classifySoftError(text);
+            bytesOut = size;
+            finish({ status, softError: true, upstreamError: text.slice(0, 2048) });
+            sendError(res, status, 'router_upstream_soft_error', `${route.name}: ${message}`);
+            resolve({ kind: 'done' });
+          });
+          up.on('error', (err) => {
+            finish({ status: HTTP_BAD_GATEWAY, error: `upstream body: ${err.message}` });
+            sendError(res, HTTP_BAD_GATEWAY, 'router_upstream_error', err.message);
+            resolve({ kind: 'done' });
+          });
+          return;
+        }
+
+        const headers = {};
+        for (const [name, value] of Object.entries(up.headers)) {
+          if (!DROPPED_RESPONSE_HEADERS.has(name.toLowerCase())) {
+            headers[name] = value;
+          }
+        }
+
+        // Keep the first bytes of an upstream error so the log carries evidence, not a verdict.
+        const errorHead = [];
+        let errorHeadBytes = 0;
+        const sniff = [];
+        let sniffBytes = 0;
+        let sniffing = stream && isSse && route.usageLimit.enabled;
+        let passthroughStarted = false;
+
+        const startPassthrough = (initial) => {
+          passthroughStarted = true;
+          if (!res.headersSent) {
+            res.writeHead(up.statusCode, headers);
+          } else if (up.statusCode !== HTTP_OK) {
+            // Headers already went out as 200 during a hold; the only channel left is SSE.
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'router_upstream_error', message: `${route.name} returned HTTP ${up.statusCode} after a usage-limit hold` })}\n\n`);
+          }
+          if (initial.length > 0) {
+            res.write(initial);
+          }
+          up.pipe(res);
+        };
+
+        up.on('data', (chunk) => {
+          bytesOut += chunk.length;
+          upstream.setTimeout(idleMs);
+          if (up.statusCode >= 400 && errorHeadBytes < 2048) {
+            errorHead.push(chunk.subarray(0, 2048 - errorHeadBytes));
+            errorHeadBytes += chunk.length;
+          }
+          if (!sniffing) {
+            return;
+          }
+          sniff.push(chunk);
+          sniffBytes += chunk.length;
+          const text = Buffer.concat(sniff).toString('utf8');
+          const boundary = text.indexOf('\n\n');
+          if (boundary === -1 && sniffBytes < SNIFF_MAX_BYTES) {
+            return;
+          }
+          sniffing = false;
+          const limit = parseUsageLimitEvent(text.slice(0, boundary === -1 ? undefined : boundary), route.usageLimit);
+          if (limit) {
+            up.resume();
+            up.on('end', () => resolve({ kind: 'usage-limit', ...limit }));
+            return;
+          }
+          startPassthrough(Buffer.concat(sniff));
+        });
+        up.on('end', () => {
+          if (sniffing) {
+            // Stream ended inside the first event; nothing indicated a usage limit.
+            sniffing = false;
+            startPassthrough(Buffer.concat(sniff));
+          }
+          if (!passthroughStarted) {
+            return;
+          }
+          const fields = { status: up.statusCode };
+          if (up.statusCode >= 400) {
+            fields.upstreamError = Buffer.concat(errorHead).toString('utf8');
+          }
+          finish(fields);
+          resolve({ kind: 'done' });
+        });
+        up.on('error', (err) => {
+          finish({ status: up.statusCode, error: `upstream body: ${err.message}` });
+          resolve({ kind: 'done' });
+        });
+        // A client abort mid-stream tears the upstream down without 'end' or 'error'; 'close'
+        // always fires, so it is the accounting backstop.
+        up.on('close', () => {
+          if (passthroughStarted) {
+            finish({ status: up.statusCode, error: 'stream closed before end' });
+            resolve({ kind: 'done' });
+          }
+        });
+        if (!sniffing) {
+          startPassthrough(Buffer.alloc(0));
+        }
+      });
+
+      upstream.on('error', (err) => {
+        const timedOut = err.code === 'ROUTER_IDLE';
+        finish({ status: timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, error: err.message });
+        if (!res.headersSent) {
+          sendError(res, timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, 'router_upstream_error',
+            `${route.name} (${target.host}): ${err.message}`);
+        } else {
+          res.destroy();
+        }
+        resolve({ kind: 'done' });
+      });
+
+      upstream.end(outgoingBody);
+    });
+
+    const holdStarted = Date.now();
+    for (;;) {
+      const outcome = await attemptUpstream();
+      if (outcome.kind !== 'usage-limit' || clientGone) {
+        return;
+      }
+      const policy = route.usageLimit;
+      const elapsed = Date.now() - holdStarted;
+      const remaining = policy.maxHoldMs - elapsed;
+      let waitMs = outcome.resetAt ? outcome.resetAt + policy.resetSlackMs - Date.now() : 0;
+      if (waitMs <= 0) {
+        waitMs = Math.min(policy.pollMs, policy.retryBaseMs * 2 ** (attempts - 1));
+      }
+      waitMs = Math.min(waitMs, remaining);
+      if (remaining <= 0) {
+        // Out of patience: hand Codex the failure exactly as the upstream phrased it.
+        finish({ status: 429, usageLimit: true, heldMs: elapsed, upstreamError: outcome.message });
+        if (!res.headersSent) {
+          res.writeHead(HTTP_OK, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        }
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'rate_limit_exceeded', message: outcome.message })}\n\n`);
+        res.end();
+        return;
+      }
+      if (!res.headersSent) {
+        res.writeHead(HTTP_OK, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.flushHeaders();
+      }
+      const until = new Date(Date.now() + waitMs).toISOString();
+      holds.set(res, { model, route: route.name, since: new Date(holdStarted).toISOString(), until, attempts });
+      logger.line({ event: 'hold', model, route: route.name, until, waitMs, attempt: attempts, upstreamError: outcome.message });
+      await heartbeat(res, waitMs, policy.heartbeatMs, until, () => clientGone);
+      holds.delete(res);
+      heldMs += waitMs;
+      if (clientGone) {
+        return;
+      }
+    }
   }
 
   const server = http.createServer((req, res) => {
