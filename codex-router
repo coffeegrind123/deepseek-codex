@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Control the local model router: ./codex-router start|stop|restart|status|logs|ensure
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS="$ROOT/.codex/secrets.env"
+PID_FILE="$ROOT/.codex/router.pid"
+LOG_FILE="$ROOT/.codex/router.log"
+ROUTER="$ROOT/router/router.mjs"
+HEALTH_ATTEMPTS=40
+HEALTH_INTERVAL=0.25
+
+die() { printf 'codex-router: %s\n' "$*" >&2; exit 1; }
+
+load_secrets() {
+  [[ -f "$SECRETS" ]] || die "missing $SECRETS (copy .codex/secrets.env.example and fill it in)"
+  set -a
+  # shellcheck disable=SC1090
+  . "$SECRETS"
+  set +a
+  : "${CODEX_ROUTER_TOKEN:?CODEX_ROUTER_TOKEN missing from $SECRETS}"
+  export CODEX_ROUTER_PORT="${CODEX_ROUTER_PORT:-8877}"
+  export CODEX_ROUTER_LOG="$LOG_FILE"
+}
+
+health_url() { printf 'http://127.0.0.1:%s/health' "$CODEX_ROUTER_PORT"; }
+
+healthy() { curl -fsS -m 2 "$(health_url)" >/dev/null 2>&1; }
+
+running_pid() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE")"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid"
+}
+
+start() {
+  if healthy; then
+    printf 'router already healthy on port %s\n' "$CODEX_ROUTER_PORT"
+    return 0
+  fi
+  if pid="$(running_pid)"; then
+    die "pid $pid is alive but /health fails; check $LOG_FILE or run: $0 restart"
+  fi
+  nohup node "$ROUTER" >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  local i
+  for ((i = 0; i < HEALTH_ATTEMPTS; i++)); do
+    if healthy; then
+      printf 'router started (pid %s) on http://127.0.0.1:%s/v1\n' "$(cat "$PID_FILE")" "$CODEX_ROUTER_PORT"
+      return 0
+    fi
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      die "router exited during startup; last log lines:
+$(tail -n 20 "$LOG_FILE")"
+    fi
+    sleep "$HEALTH_INTERVAL"
+  done
+  die "router did not become healthy; see $LOG_FILE"
+}
+
+stop() {
+  if pid="$(running_pid)"; then
+    kill "$pid"
+    local i
+    for ((i = 0; i < HEALTH_ATTEMPTS; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep "$HEALTH_INTERVAL"
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid"
+    printf 'router stopped (pid %s)\n' "$pid"
+  else
+    printf 'router not running\n'
+  fi
+  rm -f "$PID_FILE"
+}
+
+status() {
+  if healthy; then
+    curl -fsS -m 2 "$(health_url)"; echo
+    curl -fsS -m 2 -H "Authorization: Bearer $CODEX_ROUTER_TOKEN" "http://127.0.0.1:$CODEX_ROUTER_PORT/routes"; echo
+  else
+    printf 'router not healthy on port %s\n' "$CODEX_ROUTER_PORT"
+    return 1
+  fi
+}
+
+load_secrets
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  ensure) healthy || start ;;
+  logs) tail -n "${2:-50}" -f "$LOG_FILE" ;;
+  *) die "usage: $0 {start|stop|restart|status|ensure|logs [n]}" ;;
+esac

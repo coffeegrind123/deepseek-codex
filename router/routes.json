@@ -1,0 +1,16 @@
+{
+  "routes": [
+    {
+      "name": "zai",
+      "match": "glm-",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY"
+    },
+    {
+      "name": "deepseek",
+      "match": "deepseek-",
+      "base": "https://api.deepseek.com",
+      "keyEnv": "DEEPSEEK_API_KEY"
+    }
+  ]
+}

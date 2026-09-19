@@ -1,0 +1,91 @@
+# Codex configuration for this workspace. CODEX_HOME points here (set by ./codex), so
+# nothing in ~/.codex is read and sessions/logs/auth stay inside the folder.
+#
+# Model routing: one provider ("router") fronts both upstreams. The local router picks
+# z.ai for glm-* and DeepSeek for deepseek-* from each request's model field.
+# See router/router.mjs for why a single provider is unavoidable.
+
+model_provider = "router"
+model = "glm-5.3"
+model_reasoning_effort = "max"
+model_catalog_json = "models.json"
+# Codex's web_search tool is served by OpenAI's backend; neither upstream has it.
+web_search = "disabled"
+
+# Filesystem restriction lives OUTSIDE Codex: ./codex wraps the whole process tree in a
+# Landlock cage (sandbox/landlock-exec.py) that allows writes only under this folder plus
+# the roots listed in .codex/cage.conf. Codex's own Linux sandbox is bubblewrap, which
+# needs user namespaces; this container's seccomp profile denies them (unshare -> EPERM),
+# and the legacy Landlock path panics on 0.155 permission profiles. So Codex is told not
+# to wrap commands itself; the kernel policy inherited from the wrapper is what holds.
+approval_policy = "on-request"
+sandbox_mode = "danger-full-access"
+
+[model_providers.router]
+name = "Local router: z.ai GLM-5.3 / DeepSeek V4.1 Flash"
+base_url = "http://127.0.0.1:8877/v1"
+env_key = "CODEX_ROUTER_TOKEN"
+env_key_instructions = "Run codex through ./codex so .codex/secrets.env is loaded and the router is started."
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+
+# Every spawned agent runs on DeepSeek V4.1 Flash. `default_subagent_model` covers the
+# plain spawn path; the role files cover every role name the orchestrator can pass
+# (default/explorer/worker are the built-ins, redefined here so their model is pinned).
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 6
+# The catalog pins multi_agent_version = "v1" for both models on purpose: the v2 backend
+# has no nesting limit and DeepSeek Flash explorers happily spawned explorers five deep
+# (observed 2026-09-20). v1 honours max_depth, so subagents cannot spawn their own.
+max_depth = 1
+default_subagent_model = "deepseek-flash"
+default_subagent_reasoning_effort = "high"
+
+[agents.default]
+description = "General-purpose subagent (DeepSeek V4.1 Flash). Use when no specialised role fits."
+config_file = "agents/default.toml"
+
+[agents.explorer]
+description = """Use `explorer` for specific codebase questions.
+Explorers are fast and authoritative.
+They must be used to ask specific, well-scoped questions on the codebase.
+Rules:
+- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
+- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results.
+- Reuse existing explorers for related questions."""
+config_file = "agents/explorer.toml"
+
+[agents.worker]
+description = """Use for execution and production work.
+Typical tasks:
+- Implement part of a feature
+- Fix tests or bugs
+- Split large refactors into independent chunks
+Rules:
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, clearly specify which files or modules the worker is responsible for to avoid merge conflicts.
+- Always tell workers they are **not alone in the codebase**: they must not revert edits made by others and should adjust their implementation to accommodate changes made by others."""
+config_file = "agents/worker.toml"
+
+[projects."/home/claudeuser/codex"]
+trust_level = "trusted"
+
+# MCP servers shared with Claude Code. Both spawn inside the cage: Chromium keeps its
+# profile in /tmp, Ghidra keeps its state in /root/.config/ghidra (see .codex/cage.conf).
+[mcp_servers.browser]
+command = "python"
+args = ["/opt/zendriver-mcp/run.py"]
+env = { DISPLAY = ":99", ZENDRIVER_MCP_GATEWAY = "1" }
+startup_timeout_sec = 60
+tool_timeout_sec = 300
+
+[mcp_servers.ghidra]
+command = "python3"
+args = ["/home/claudeuser/ghidra-in-claude-code/launch_ghidra_mcp.py"]
+env = { GHIDRA_HOME = "/opt/ghidra_12.0.3_PUBLIC", JAVA_HOME = "/opt/jdk-21.0.10+7" }
+startup_timeout_sec = 180
+tool_timeout_sec = 600

@@ -1,0 +1,6 @@
+# Role layer for spawned agents without an explicit role. Only model, reasoning,
+# verbosity, personality, service_tier, developer_instructions, feature/skill
+# restrictions are honoured here (codex-rs/core/src/agent/role.rs).
+model = "deepseek-flash"
+model_reasoning_effort = "high"
+developer_instructions = """Never spawn agents; do the delegated work yourself. You are a subagent spawned by an orchestrator. Complete exactly the delegated task, stay inside the workspace folder, and report concrete results (file paths, commands run, outputs) rather than summaries of intent."""

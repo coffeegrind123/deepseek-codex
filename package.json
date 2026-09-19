@@ -1,0 +1,15 @@
+{
+  "name": "codex-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Folder-restricted OpenAI Codex CLI: GLM-5.3 (z.ai) orchestrator, DeepSeek Flash subagents",
+  "scripts": {
+    "codex": "./codex",
+    "router": "node router/router.mjs",
+    "models": "node scripts/build-models.mjs",
+    "test": "node --test router/router.test.mjs"
+  },
+  "dependencies": {
+    "@openai/codex": "0.155.1"
+  }
+}

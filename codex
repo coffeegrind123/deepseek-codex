@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Run the folder-local Codex CLI: CODEX_HOME and cwd are this folder, the model router is
+# started outside the cage, then codex and everything it spawns run under a Landlock
+# policy that can write only here (+ .codex/cage.conf roots). All args pass to codex.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$ROOT/node_modules/.bin/codex"
+CAGE="$ROOT/sandbox/landlock-exec.py"
+
+[[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
+
+"$ROOT/codex-router" ensure >/dev/null
+
+set -a
+# shellcheck disable=SC1091
+. "$ROOT/.codex/secrets.env"
+set +a
+
+CAGE_RW=()
+CAGE_NET="${CODEX_NET:-open}"
+# shellcheck disable=SC1091
+[[ -f "$ROOT/.codex/cage.conf" ]] && . "$ROOT/.codex/cage.conf"
+
+cage_args=(--rw "$ROOT")
+for dir in "${CAGE_RW[@]}"; do
+  [[ -d "$dir" ]] && cage_args+=(--rw "$dir")
+done
+if [[ "$CAGE_NET" == "restricted" ]]; then
+  cage_args+=(--net restricted --tcp-connect "${CODEX_ROUTER_PORT:-8877}")
+else
+  cage_args+=(--net open)
+fi
+
+export CODEX_HOME="$ROOT/.codex"
+export TMPDIR="${TMPDIR:-/tmp}"
+cd "$ROOT"
+exec python3 "$CAGE" "${cage_args[@]}" -- "$BIN" "$@"
