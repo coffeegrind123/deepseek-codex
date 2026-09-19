@@ -12,6 +12,72 @@ npm test                     router unit tests
 npm run models               regenerate .codex/models.json from .codex/catalog/
 ```
 
+## Day-to-day use
+
+### Starting
+
+```sh
+./codex                          # interactive TUI
+./codex exec "prompt" </dev/null # one-shot; close stdin or exec waits for piped input
+./codex --help                   # every arg is passed straight to codex
+```
+
+`./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
+then runs Codex with this folder as cwd and `CODEX_HOME`.
+
+### Approvals
+
+`config.toml` sets `approval_policy = "on-request"`: the model runs commands on its own and
+only stops when it decides to ask. `sandbox_mode` is `danger-full-access` because the cage,
+not Codex, is the sandbox — so "bypass sandbox" flags change nothing about what can be
+written. Fully hands-off:
+
+```sh
+./codex -a never        # never ask; a failed command is returned to the model
+./codex --yolo          # alias of --dangerously-bypass-approvals-and-sandbox; same effect here
+```
+
+Make it permanent with `approval_policy = "never"` in `.codex/config.toml`, or switch
+mid-session with `/permissions`. Not applicable in this build/setup: `--full-auto` (flag
+does not exist in 0.155.1) and `--approve-for-me` (routes approvals through an
+OpenAI-hosted reviewer, which these providers do not have).
+
+### Resuming
+
+```sh
+./codex resume                   # picker of past sessions
+./codex resume --last            # most recent session
+./codex resume <id-or-name>      # a specific one; /rename <name> in the TUI names a session
+./codex fork --last              # branch a past session into a new one
+./codex exec resume --last "next prompt" </dev/null   # non-interactive continuation
+```
+
+Sessions live in `.codex/sessions/` (git-ignored). Every subagent gets its own rollout file
+there too; `session_meta.source.subagent` records role, depth and parent.
+
+### Goals
+
+A goal is a persistent objective the TUI keeps working toward whenever the session is
+idle, with an optional token budget:
+
+```
+/goal <objective>          set it and start
+/goal pause | resume | edit | clear
+```
+
+The status line reports `Goal paused / stalled / hit usage limits (/goal resume)` when it
+needs you. Cap budgets with `goals.max_goal_token_budget` in `config.toml`.
+
+### Other useful commands
+
+```sh
+./codex-router status | logs | restart     # router health, request log, restart after key changes
+./codex mcp list                           # MCP servers as Codex sees them
+./codex debug models                       # the catalog Codex loaded
+./codex debug prompt-input                 # what the model actually receives (AGENTS.md etc.)
+CODEX_NET=restricted ./codex               # TCP limited to the router port (breaks browser/Ghidra MCP)
+```
+
 ## How the pieces fit
 
 ```
