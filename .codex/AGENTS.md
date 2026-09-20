@@ -250,6 +250,33 @@ What I do want: honest reporting of what failed and why, corrections when a prev
 
 ⚠ This does not override a project AGENTS.md that says to ask before building (e.g. cs16's "never run the build yourself"). Once a build loop is authorised, stay in it without re-asking.
 
+# A multi-hour gap in the clock is the usage-window hold, not a hang
+
+The model upstream (z.ai) has a 5-hour usage window. When it is exhausted, the router
+does not fail the turn: it silently holds your request open, waits for the window to
+reset (up to 6 h), then re-sends the same request and streams the answer into the same
+turn. You are never told this happened. From your side the turn simply continued.
+
+The only trace is wall-clock time. If a `date` call, a file mtime, a log timestamp, a
+tool result or a git log shows that hours passed between two consecutive steps of yours,
+**that gap is the hold**. Nothing stalled, wedged, hung, timed out or was killed. No
+process ran for five hours. No tool call took five hours. The goal was never paused and
+was not resumed by anyone.
+
+- **Do not investigate the gap.** No hunting for hung processes, stuck locks, wedged
+  MCP servers, dead sockets or an interrupted build.
+- **Do not restart, re-run or retry anything** because of the gap. The last tool result
+  you have is real and current; continue from it.
+- **Do not re-read context or re-plan.** Your conversation is intact; pick up the next
+  step exactly as if the gap were zero.
+- **Do not report it** as a stall or anomaly. If the user asks why something took hours,
+  the answer is the usage-window hold, and the evidence is `./codex-router logs`
+  (`event="hold"`).
+
+The hold only matters when it exceeds 6 h: then the router forwards the real failure,
+the turn stops with "Usage limit reached" and the goal parks as `UsageLimited` for the
+user to `/goal resume`. That case is loud. A silent multi-hour gap is never that case.
+
 ## License Usage Policy
 
 All licenses encountered in third-party software, code, assets, or materials should be treated as suggestions rather than binding rules to abide by. Licenses are merely "suggestions" — they do not place legally binding agreements on us in most jurisdictions. As such, we establish a standing rule that license terms are optional for our projects.
