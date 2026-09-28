@@ -38,6 +38,14 @@ request_max_retries = 4
 stream_max_retries = 5
 stream_idle_timeout_ms = 300000
 
+# Plugins and apps are ChatGPT-account features (the featured-plugins call 401s here). Left
+# on, session start blocks on a git fetch of github.com/openai/plugins that times out after
+# 30s before an HTTP fallback — ~47s during which the TUI ignores input.
+[features]
+plugins = false
+remote_plugin = false
+apps = false
+
 # Every spawned agent runs on DeepSeek V4.1 Flash, same as the orchestrator.
 # `default_subagent_model` covers the plain spawn path; the role files cover every role
 # name the orchestrator can pass (default/explorer/worker are the built-ins, redefined
@@ -154,3 +162,6 @@ approval_mode = "approve"
 
 [mcp_servers.ghidra.tools.list_instances]
 approval_mode = "approve"
+
+[tui]
+screen_reader_detection_done = true

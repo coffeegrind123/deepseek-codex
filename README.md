@@ -25,6 +25,11 @@ npm run models               regenerate .codex/models.json from .codex/catalog/
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with this folder as cwd and `CODEX_HOME`.
 
+The session takes ~15s to start (see *Startup time* under Operations); the TUI drops typed
+input until it is ready. Two startup warnings are expected: `--dangerously-bypass-hook-trust`
+(passed by `./codex`, see *End-result verifier*) and "Running without the shared background
+server" (the TUI runs its app server in-process).
+
 ### Approvals — yolo by default
 
 `config.toml` sets `approval_policy = "never"`: the model runs every command on its own
@@ -182,7 +187,7 @@ browser and Ghidra MCP servers, which need the network).
 
 | Path | Purpose |
 | --- | --- |
-| `.codex/config.toml` | provider, models, roles, MCP servers, trust, verifier hooks |
+| `.codex/config.toml` | provider, models, roles, feature flags, MCP servers, trust, verifier hooks |
 | `.codex/AGENTS.md` | the only instructions file (Codex's `~/.claude/CLAUDE.md` equivalent): agentic prompt + this workspace's cage, models and layout |
 | `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker`, `verifier` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
 | `.codex/hooks/` | end-result verifier: `verify.py` (Stop + `update_goal` hook), `verifier_prompt.md`, `verify_test.py`; `state/` (round counters) git-ignored |
@@ -215,5 +220,12 @@ bridge) are the same servers Claude Code uses, declared in `config.toml`. Tool n
   latency, bytes; upstream error bodies are captured verbatim.
 - Add a model: drop a catalog entry in `.codex/catalog/`, add a prefix to
   `router/routes.json` if it is a new upstream, `npm run models`, `./codex-router restart`.
+- Startup time: before the session exists Codex recursively walks every skill root
+  (`.codex/skills/`, symlinks followed, `.git` included, depth 6), and every entry costs
+  several round trips on the 9p mount — a 22k-entry skill took ~75s. Keep large
+  trees (data, models, venvs, build output) out of skill directories and `git gc` skill
+  checkouts with many loose objects. `plugins`, `remote_plugin` and `apps` are off in
+  `[features]`: they need a ChatGPT account, and plugins made each start block ~47s on a
+  timed-out `git fetch` of `github.com/openai/plugins`.
 - Upgrade Codex: `npm install @openai/codex@<ver>`; refresh `.codex/catalog/base_instructions.md`
   from `codex-rs/models-manager/prompt.md` at the matching `rust-v<ver>` tag.
