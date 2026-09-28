@@ -183,8 +183,7 @@ browser and Ghidra MCP servers, which need the network).
 | Path | Purpose |
 | --- | --- |
 | `.codex/config.toml` | provider, models, roles, MCP servers, trust, verifier hooks |
-| `.codex/AGENTS.md` | global instructions (Codex's `~/.claude/CLAUDE.md` equivalent) |
-| `AGENTS.md` | project-level notes Codex also loads (cage, layout) |
+| `.codex/AGENTS.md` | the only instructions file (Codex's `~/.claude/CLAUDE.md` equivalent): agentic prompt + this workspace's cage, models and layout |
 | `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker`, `verifier` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
 | `.codex/hooks/` | end-result verifier: `verify.py` (Stop + `update_goal` hook), `verifier_prompt.md`, `verify_test.py`; `state/` (round counters) git-ignored |
 | `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
