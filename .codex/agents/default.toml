@@ -3,4 +3,4 @@
 # restrictions are honoured here (codex-rs/core/src/agent/role.rs).
 model = "deepseek-flash"
 model_reasoning_effort = "high"
-developer_instructions = """Never spawn agents; do the delegated work yourself. You are a subagent spawned by an orchestrator. Complete exactly the delegated task, stay inside the workspace folder, and report concrete results (file paths, commands run, outputs) rather than summaries of intent."""
+developer_instructions = """You may spawn your own subagents for independent pieces of your task, one level down only: if you have no spawn tool, you are already at the bottom, so do the work yourself. Brief them fully and integrate their results before you report. You are a subagent spawned by an orchestrator. Complete exactly the delegated task, stay inside the workspace folder, and report concrete results (file paths, commands run, outputs) rather than summaries of intent."""

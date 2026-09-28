@@ -10,6 +10,10 @@ node_modules/
 .codex/.sandbox_migration
 .codex/plugins/
 .codex/skills/.system/
+.codex/hooks/state/
+.codex/hooks/__pycache__/
+# Separate git checkout with credentials and state; setup.sh clones it.
+.codex/skills/veikkaus-browser/
 sandbox-test/
 .codex/shell_snapshots/
 .codex/log/

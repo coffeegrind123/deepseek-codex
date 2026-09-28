@@ -34,5 +34,19 @@ fi
 
 export CODEX_HOME="$ROOT/.codex"
 export TMPDIR="${TMPDIR:-/tmp}"
+
+# End-result verifier hooks (.codex/config.toml -> .codex/hooks/verify.py) are enabled by
+# passing --dangerously-bypass-hook-trust: config hooks otherwise run only after being
+# trusted interactively via /hooks, which non-interactive `./codex exec` can't do. The
+# flag's own help says it is "intended only for automation that already vets hook sources"
+# — that is this case: the hooks are version-controlled in this workspace, authored here,
+# and .codex/AGENTS.md forbids the agent editing config from untrusted content. It applies
+# ONLY to hooks; it changes nothing about the Landlock cage or command approvals.
+# Opt out (e.g. to rely on persisted /hooks trust in a TUI session) with CODEX_HOOK_TRUST=strict.
+hook_args=()
+if [[ "${CODEX_HOOK_TRUST:-bypass}" != "strict" ]]; then
+  hook_args+=(--dangerously-bypass-hook-trust)
+fi
+
 cd "$ROOT"
-exec python3 "$CAGE" "${cage_args[@]}" -- "$BIN" "$@"
+exec python3 "$CAGE" "${cage_args[@]}" -- "$BIN" "${hook_args[@]}" "$@"

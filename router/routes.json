@@ -1,13 +1,6 @@
 {
   "routes": [
     {
-      "name": "zai",
-      "match": "glm-",
-      "base": "https://api.z.ai/api/v1",
-      "keyEnv": "ZAI_API_KEY",
-      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
-    },
-    {
       "name": "deepseek",
       "match": "deepseek-",
       "base": "https://api.deepseek.com",

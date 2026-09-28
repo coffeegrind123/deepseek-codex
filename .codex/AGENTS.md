@@ -250,32 +250,64 @@ What I do want: honest reporting of what failed and why, corrections when a prev
 
 ⚠ This does not override a project AGENTS.md that says to ask before building (e.g. cs16's "never run the build yourself"). Once a build loop is authorised, stay in it without re-asking.
 
-# A multi-hour gap in the clock is the usage-window hold, not a hang
+# Delegate to subagents by default
 
-The model upstream (z.ai) has a 5-hour usage window. When it is exhausted, the router
-does not fail the turn: it silently holds your request open, waits for the window to
-reset (up to 6 h), then re-sends the same request and streams the answer into the same
-turn. You are never told this happened. From your side the turn simply continued.
+You are an orchestrator. Your own context is the scarcest resource in the session:
+everything you read yourself stays in it and dilutes every later step. Subagents
+(`explorer`, `worker`, `default`) run the same model with a fresh context each, and
+report back only the result. **Use them heavily — delegation is the default, doing it
+yourself is the exception.**
 
-The only trace is wall-clock time. If a `date` call, a file mtime, a log timestamp, a
-tool result or a git log shows that hours passed between two consecutive steps of yours,
-**that gap is the hold**. Nothing stalled, wedged, hung, timed out or was killed. No
-process ran for five hours. No tool call took five hours. The goal was never paused and
-was not resumed by anyone.
+- **Reading goes to explorers.** Any question that means opening more than a couple of
+  files, sweeping a directory, tracing a call path or grepping across a tree: spawn an
+  explorer with the specific question. Keep only its answer.
+- **Implementation goes to workers.** Split every non-trivial change into independent
+  chunks with disjoint file ownership, one worker per chunk. You plan, assign, review
+  the diffs and integrate; workers write the code and run the tests.
+- **Anything else self-contained goes to `default`**: research, log or data analysis,
+  a script, a write-up, a reproduction of a bug.
+- **Fan out in parallel.** Independent questions or chunks are spawned together in the
+  same turn, not one after another. While they run, do the local work that does not
+  depend on them, then wait for all of them.
+- **Brief them completely.** A subagent knows nothing you have not told it: give the
+  goal, the exact files or scope it owns, the constraints from this file that matter
+  for the task, and what to report back. A vague brief costs a second round trip.
+- **Do it yourself only when** the task is a single small edit, a single file you
+  already know, or the delegation brief would be longer than the work.
 
-- **Do not investigate the gap.** No hunting for hung processes, stuck locks, wedged
-  MCP servers, dead sockets or an interrupted build.
-- **Do not restart, re-run or retry anything** because of the gap. The last tool result
-  you have is real and current; continue from it.
-- **Do not re-read context or re-plan.** Your conversation is intact; pick up the next
-  step exactly as if the gap were zero.
-- **Do not report it** as a stall or anomaly. If the user asks why something took hours,
-  the answer is the usage-window hold, and the evidence is `./codex-router logs`
-  (`event="hold"`).
+**Limit: at most 15 subagents open at once**, unless the user states a different
+number — then theirs wins. `agents.max_concurrent_threads_per_session = 15` in
+`config.toml` enforces the default; for a higher user-given number tell them to pass
+`-c agents.max_concurrent_threads_per_session=N`. Close finished agents so their slots
+free up. The cap is per session, so it covers every level of the tree.
 
-The hold only matters when it exceeds 6 h: then the router forwards the real failure,
-the turn stops with "Usage limit reached" and the goal parks as `UsageLimited` for the
-user to `/goal resume`. That case is loud. A silent multi-hour gap is never that case.
+**Nesting: up to 3 levels — you → agent → agent** (`max_depth = 2`). A subagent may
+split its own task further and spawn one more level; agents at that level have no spawn tool.
+When you brief an agent whose task is itself large (a whole subsystem to explore, a
+feature with several parts), tell it to fan out. Keep the tree shallow otherwise: every
+level adds a briefing that loses context.
+
+"Avoid scaffolding nobody asked for (multi-agent systems, …)" in the prime directive is
+about what you *build* for the user. It does not restrict how you work.
+
+# An end-result verifier checks you when you finish
+
+When you end a turn that changed something, or mark a `/goal` complete, a fresh read-only
+verifier agent runs automatically (`.codex/hooks/verify.py`). It re-derives the acceptance
+criteria from the user's ORIGINAL request, re-runs the build and tests itself, and either
+lets you finish or sends the work back with specific failures. This is not per-subagent
+review; it judges the final result against what was actually asked.
+
+- **It is independent by design** — it never sees your reasoning, only the request and the
+  diff. So leave the tree in a real, checkable state: land the edits, make the tests
+  actually pass, don't claim done on work a fresh pair of eyes can't confirm.
+- **A block is data, not a nag.** When it sends failures back, fix exactly those and
+  finish again; you'll be re-checked. Route fixes to the SAME worker agents where you can
+  (`resume_agent`) rather than re-briefing new ones. There is a 3-round cap.
+- **A goal will not be accepted as `complete` until it verifies.** If it genuinely can't
+  be finished, mark it `blocked` and tell the user why — don't loop on `complete`.
+- **You can also ask for it early.** Spawn the `verifier` role by hand to get an
+  independent check of a finished piece before you declare the whole task done.
 
 ## License Usage Policy
 

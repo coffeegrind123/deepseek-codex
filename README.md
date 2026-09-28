@@ -1,4 +1,4 @@
-# Folder-local Codex: GLM-5.3 orchestrator, DeepSeek Flash subagents, Landlock cage
+# Folder-local Codex: DeepSeek Flash orchestrator and subagents, Landlock cage
 
 ```
 git clone git@github.com:coffeegrind123/codex-workspace.git codex && cd codex
@@ -25,21 +25,23 @@ npm run models               regenerate .codex/models.json from .codex/catalog/
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with this folder as cwd and `CODEX_HOME`.
 
-### Approvals
+### Approvals — yolo by default
 
-`config.toml` sets `approval_policy = "on-request"`: the model runs commands on its own and
-only stops when it decides to ask. `sandbox_mode` is `danger-full-access` because the cage,
-not Codex, is the sandbox — so "bypass sandbox" flags change nothing about what can be
-written. Fully hands-off:
+`config.toml` sets `approval_policy = "never"`: the model runs every command on its own
+without asking. That's the intended mode here. It's safe only because `sandbox_mode` is
+`danger-full-access` and the **Landlock cage**, not Codex, is what bounds writes — an
+approval prompt would gate nothing the cage doesn't already stop, and the end-result
+verifier still gates completion. So plain `./codex` and `./codex exec` are already fully
+hands-off; there is nothing extra to pass.
 
 ```sh
-./codex -a never        # never ask; a failed command is returned to the model
-./codex --yolo          # alias of --dangerously-bypass-approvals-and-sandbox; same effect here
+./codex                 # yolo: never asks (approval_policy = "never")
+./codex --yolo          # identical effect; the explicit flag if you prefer it
+./codex -a on-request   # opposite: make the model ask this run
 ```
 
-Make it permanent with `approval_policy = "never"` in `.codex/config.toml`, or switch
-mid-session with `/permissions`. Not applicable in this build/setup: `--full-auto` (flag
-does not exist in 0.155.1) and `--approve-for-me` (routes approvals through an
+Switch mid-session with `/permissions`. Not applicable in this build/setup: `--full-auto`
+(flag does not exist in 0.158.0) and `--approve-for-me` (routes approvals through an
 OpenAI-hosted reviewer, which these providers do not have).
 
 ### Resuming
@@ -68,30 +70,77 @@ idle, with an optional token budget:
 The status line reports `Goal paused / stalled / hit usage limits (/goal resume)` when it
 needs you. Cap budgets with `goals.max_goal_token_budget` in `config.toml`.
 
-#### Usage limits do not pause goals here
+#### Usage-limit hold (dormant)
 
-z.ai's GLM Coding Plan has a 5-hour usage window. When it is exhausted, z.ai answers with
-a `response.failed` / `rate_limit_exceeded` event carrying the reset time; stock Codex
-turns that into "Usage limit reached", stops the turn and parks the goal as
-`UsageLimited` until you type `/goal resume` — there is no built-in auto-resume
-([openai/codex#28931](https://github.com/openai/codex/issues/28931), open).
+The router can swallow an upstream's "usage limit reached" SSE failure, keep Codex's
+stream alive with `router.hold` heartbeats, and re-send the request once the window
+resets, so a goal never parks as `UsageLimited`. It was built for z.ai's 5-hour GLM
+window and is off now: DeepSeek is pay-as-you-go with no such window. A route opts in
+with `"usageLimit": { "enabled": true, ... }` in `routes.json` (see `router/router.mjs`,
+`DEFAULT_USAGE_LIMIT`; covered by `npm test`).
 
-The router removes the pause instead of automating the resume. `routes.json` enables
-`usageLimit` for the z.ai route: the router sniffs the first SSE event of every reply,
-and when it is the usage-limit failure it does not forward it. It keeps Codex's stream
-open with a `router.hold` heartbeat event every 10 s (Codex's idle timer counts parsed
-events, not bytes, so a comment line would not do), waits until the reset time plus 5 s
-(z.ai prints it in Asia/Shanghai time; `resetTzOffsetMinutes = 480`), then re-sends the
-identical request and streams the real answer into the same turn. Codex never sees an
-error, so the goal stays `Active` and the turn resumes exactly where it stopped — no
-re-reading of context. If the reset time is missing or already past it retries on a
-30 s → 5 min backoff; after `maxHoldMs` (6 h) it gives up and forwards the failure, at
-which point the goal pauses as before. A hold is visible in `./codex-router status`
-(`holds`) and in the log as `event="hold"`. Nothing else changes: the goal's own token
-budget, `/goal pause` and completion still stop it.
+### Subagents
 
-Verified with a mock z.ai that rate-limits first: Codex, configured with a 20 s idle
-timeout, stayed on one stream through an 85 s hold and finished the turn.
+The orchestrator and every subagent run on `deepseek-flash` (orchestrator at `max`
+reasoning, `default`/`worker` at `high`, `explorer` at `low`). `.codex/AGENTS.md`
+("Delegate to subagents by default") and the role descriptions in `config.toml` push the
+orchestrator to fan work out: explorers for reading, workers for disjoint chunks of
+implementation, `default` for anything else self-contained.
+
+At most 15 subagents are open at once (`agents.max_concurrent_threads_per_session`);
+the orchestrator is told a user-stated number wins. To actually allow more in a run:
+
+```sh
+./codex -c agents.max_concurrent_threads_per_session=30
+```
+
+Nesting is capped at three levels, orchestrator → agent → agent: `max_depth = 2` on the
+v1 multi-agent backend (depth counts from the orchestrator at 0). Agents at depth 2
+get no spawn tool. The 15-agent cap is per session and covers the whole tree.
+
+### End-result verifier
+
+Codex 0.158 has no built-in end-of-task verifier — it only lets a hook reject "done" and
+feed a reason back to the model (verified at rust-v0.158.0: `hooks/src/events/stop.rs`,
+`pre_tool_use.rs`; `core/src/session/turn.rs` resumes the same turn on a block). This
+workspace adds one. It checks the **final result against your original request**, not each
+subagent's output.
+
+`.codex/hooks/verify.py` serves two hook points (wired in `config.toml`), both meaning
+"the agent thinks it's finished":
+
+- **PreToolUse on `update_goal`** — gates `/goal` completion. An unverified goal can never
+  be marked `complete`; the honest escape is `blocked` (which passes through untouched, so
+  the model must justify it to you). Nothing passes silently.
+- **Stop on a root turn that actually changed something** — ordinary tasks. A pure Q&A
+  turn (no command, edit or spawn) is skipped. While a goal is active in that session, the
+  `update_goal` gate owns verification and Stop stands down.
+
+On either, it spawns a fresh, adversarial verifier (`deepseek-flash`, clean context, none
+of the implementer's reasoning) that derives the acceptance criteria from your own words,
+**re-runs the real build/tests itself**, and returns a JSON verdict with per-criterion
+evidence. Design points:
+
+- **Independent.** It sees the request + `git` diff, never the author's reasoning or a
+  subagent's claim. Same model, fresh context — the point is independence, not a smarter
+  model (`.codex/agents/verifier.toml` is the same role, spawnable by hand).
+- **Read-only, enforced.** The container can't run Codex's read-only sandbox without
+  breaking build caches, so instead the hook hashes `git diff` before and after: if the
+  verifier touched a tracked file, its verdict is discarded and the work goes back.
+- **Fail-closed.** No verdict, a crash, or a timeout counts as failure, never a free pass.
+- **Bounded.** At most 3 verify rounds per task (`MAX_ROUNDS`); at the cap the model is
+  ordered to tell you exactly what is unverified rather than the loop ending quietly.
+- **No recursion.** The verifier's own `codex exec` carries `VERIFIER_ACTIVE=1`, which
+  makes `verify.py` a no-op for that process.
+
+Config hooks run only once trusted, which non-interactive `./codex exec` can't do
+interactively, so the `./codex` wrapper passes `--dangerously-bypass-hook-trust` (its help:
+"intended only for automation that already vets hook sources" — these hooks are
+version-controlled here and `.codex/AGENTS.md` forbids the agent editing config from
+untrusted content). It affects hooks only, not the cage or command approvals. Opt out with
+`CODEX_HOOK_TRUST=strict ./codex` (then trust once via `/hooks` in the TUI).
+
+Logic tests: `python3 .codex/hooks/verify_test.py`.
 
 ### Other useful commands
 
@@ -107,7 +156,6 @@ CODEX_NET=restricted ./codex               # TCP limited to the router port (bre
 
 ```
 ./codex ──► codex-router ensure ──► router/router.mjs :8877 (outside the cage)
-   │                                     ├─ glm-*      ──► https://api.z.ai/api/v1      (ZAI_API_KEY)
    │                                     └─ deepseek-* ──► https://api.deepseek.com     (DEEPSEEK_API_KEY)
    └─► sandbox/landlock-exec.py --rw . --rw /tmp ... ──► node_modules/.bin/codex
             (kernel policy inherited by subagents, MCP servers, every shell command)
@@ -117,7 +165,9 @@ CODEX_NET=restricted ./codex               # TCP limited to the router port (bre
 `model` but not a provider (`codex-rs/core/src/agent/role.rs`, `AgentRoleOverrides`).
 The router is the single provider and picks the upstream from each request's `model`.
 Pre-0.149 community setups put `[model_providers.*]` inside the role TOML; that stopped
-working in 0.149+, which is why the router exists.
+working in 0.149+, which is why the router exists. With DeepSeek as the only upstream it
+stays: per-request logging, body rewrites, and a second upstream is one `routes.json`
+entry away.
 
 **Why Landlock and not Codex's sandbox.** Codex's Linux sandbox is bubblewrap and needs
 user namespaces; this container's seccomp profile denies them (`unshare -Ur` → EPERM) and
@@ -135,13 +185,13 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/config.toml` | provider, models, roles, MCP servers, trust |
 | `.codex/AGENTS.md` | global instructions (Codex's `~/.claude/CLAUDE.md` equivalent) |
 | `AGENTS.md` | project-level notes Codex also loads (cage, layout) |
-| `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 1` so subagents cannot nest |
-| `.codex/catalog/` | model metadata sources; `glm-5.3.json`, `deepseek-flash.json` (DeepSeek's official entry), `base_instructions.md` (Codex prompt.md @ rust-v0.155.1) |
+| `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
+| `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
 | `.codex/models.json` | generated catalog (`npm run models`) |
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
 | `.codex/secrets.env` | API keys + router token, mode 600, git-ignored |
-| `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re` |
-| `router/routes.json` | model prefix → upstream table, per-route `usageLimit` hold policy |
+| `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re`; `veikkaus-browser` is a separate copy (its own git checkout, `.env` and state), git-ignored here |
+| `router/routes.json` | model prefix → upstream table, per-route `usageLimit` hold policy (off) |
 | `setup.sh` | reproduce on a fresh clone; `--check` verifies |
 
 Machine-specific paths that `setup.sh` does not manage: the `ghidra` MCP launcher

@@ -10,6 +10,10 @@ SECRETS="$ROOT/.codex/secrets.env"
 CONFIG="$ROOT/.codex/config.toml"
 CLAUDE_SKILLS="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 SKILLS=(browser-automation ghidra-re)
+# Skills this workspace owns a separate copy of (own git checkout, .env and state), so the
+# caged Codex can write to them without touching the Claude Code copy.
+VEIKKAUS_SKILL="$ROOT/.codex/skills/veikkaus-browser"
+VEIKKAUS_REPO="https://github.com/coffeegrind123/veikkaus-browser-skill.git"
 CHECK_ONLY=0
 [[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
 
@@ -41,12 +45,10 @@ printf '== secrets\n'
 if [[ ! -f "$SECRETS" ]]; then
   (( CHECK_ONLY )) && die "$SECRETS missing"
   umask 077
-  read -r -p "  ZAI_API_KEY (32hex.16chars): " zai
   read -r -p "  DEEPSEEK_API_KEY (sk-...): " ds
   token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   cat >"$SECRETS" <<EOS
 # Loaded by ./codex and ./codex-router. Never commit this file.
-ZAI_API_KEY=$zai
 DEEPSEEK_API_KEY=$ds
 # Shared secret between Codex and the local router (generated at setup).
 CODEX_ROUTER_TOKEN=$token
@@ -57,7 +59,7 @@ fi
 chmod 600 "$SECRETS"
 # shellcheck disable=SC1090
 . "$SECRETS"
-for var in ZAI_API_KEY DEEPSEEK_API_KEY CODEX_ROUTER_TOKEN; do
+for var in DEEPSEEK_API_KEY CODEX_ROUTER_TOKEN; do
   [[ -n "${!var:-}" && "${!var}" != *'<'* ]] || die "$var not set in $SECRETS"
 done
 ok "secrets present, mode $(stat -c %a "$SECRETS")"
@@ -69,6 +71,16 @@ if ! grep -qF "[projects.\"$ROOT\"]" "$CONFIG"; then
   sed -i -E "s|^\[projects\.\"[^\"]+\"\]|[projects.\"$ROOT\"]|" "$CONFIG"
 fi
 ok "projects trust -> $ROOT"
+
+printf '== verifier hook\n'
+for f in .codex/hooks/verify.py .codex/hooks/verifier_prompt.md .codex/agents/verifier.toml; do
+  [[ -f "$ROOT/$f" ]] || die "$f missing"
+done
+if (( ! CHECK_ONLY )); then
+  python3 "$ROOT/.codex/hooks/verify_test.py" >/dev/null 2>&1 || die "verify_test.py failed"
+fi
+grep -q 'verify.py' "$CONFIG" || die "config.toml does not wire the verifier hook"
+ok "verify.py + verifier role wired"
 
 printf '== model catalog\n'
 if (( ! CHECK_ONLY )); then
@@ -87,6 +99,15 @@ for skill in "${SKILLS[@]}"; do
   fi
 done
 
+printf '== skills (own copies)\n'
+if [[ ! -d "$VEIKKAUS_SKILL/.git" ]]; then
+  (( CHECK_ONLY )) && die "$VEIKKAUS_SKILL missing; run without --check"
+  git clone --recurse-submodules "$VEIKKAUS_REPO" "$VEIKKAUS_SKILL"
+fi
+[[ -f "$VEIKKAUS_SKILL/SKILL.md" ]] || die "$VEIKKAUS_SKILL/SKILL.md missing"
+ok "veikkaus-browser ($(git -C "$VEIKKAUS_SKILL" rev-parse --short HEAD))"
+[[ -f "$VEIKKAUS_SKILL/.env" ]] || warn "veikkaus-browser/.env missing; copy it from the Claude Code copy (credentials, not in git)"
+
 printf '== MCP server launchers (from config.toml)\n'
 for path in /opt/zendriver-mcp/run.py "$HOME/ghidra-in-claude-code/launch_ghidra_mcp.py"; do
   [[ -e "$path" ]] && ok "$path" || warn "$path missing; that MCP server will fail to start (disable it in config.toml)"
@@ -104,7 +125,7 @@ probe() {
     -H "Authorization: Bearer $CODEX_ROUTER_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"model\":\"$model\",\"input\":\"Reply OK\",\"stream\":true,\"max_output_tokens\":16}"
 }
-for model in glm-5.3 deepseek-flash; do
+for model in deepseek-flash; do
   code="$(probe "$model")"
   [[ "$code" == 200 ]] && ok "$model -> HTTP $code" || warn "$model -> HTTP $code (see .codex/router.log)"
 done

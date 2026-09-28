@@ -3,11 +3,14 @@
 //
 // Codex only supports ONE model_provider per session, and agent roles can override
 // `model` but not `model_provider` (codex-rs/core/src/agent/role.rs, AgentRoleOverrides).
-// To run the orchestrator on z.ai GLM and subagents on DeepSeek, Codex points at this
-// process and the router picks the upstream from the `model` field of each request:
+// So Codex points at this process and the router picks the upstream from the `model`
+// field of each request (router/routes.json). Today there is one upstream:
 //
-//   Codex ──► 127.0.0.1:PORT/v1/responses ──┬─ glm-*      ──► https://api.z.ai/api/v1/responses
-//             (Authorization: router token) └─ deepseek-* ──► https://api.deepseek.com/responses
+//   Codex ──► 127.0.0.1:PORT/v1/responses ──► deepseek-* ──► https://api.deepseek.com/responses
+//             (Authorization: router token)
+//
+// The usage-limit hold below was written for z.ai's GLM Coding Plan (retired); it stays
+// available to any route that sets `usageLimit.enabled`.
 //
 // The router swaps the bearer token for the upstream key, streams the body back
 // untouched (SSE passthrough), and logs one line per request with raw evidence.

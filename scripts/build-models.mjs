@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const catalogDir = path.join(root, '.codex', 'catalog');
 const output = path.join(root, '.codex', 'models.json');
-const ORDER = ['glm-5.3', 'deepseek-flash'];
+const ORDER = ['deepseek-flash'];
 
 const models = fs.readdirSync(catalogDir)
   .filter((name) => name.endsWith('.json'))
