@@ -1,7 +1,7 @@
 # Folder-local Codex: DeepSeek Flash orchestrator and subagents, Landlock cage
 
 ```
-git clone git@github.com:coffeegrind123/codex-workspace.git codex && cd codex
+git clone git@github.com:coffeegrind123/deepseek-codex.git codex && cd codex
 ./setup.sh                   npm ci, keys -> .codex/secrets.env, catalog, skills, router, key probes
 ./setup.sh --check           verify an existing clone
 
@@ -182,10 +182,11 @@ browser and Ghidra MCP servers, which need the network).
 
 | Path | Purpose |
 | --- | --- |
-| `.codex/config.toml` | provider, models, roles, MCP servers, trust |
+| `.codex/config.toml` | provider, models, roles, MCP servers, trust, verifier hooks |
 | `.codex/AGENTS.md` | global instructions (Codex's `~/.claude/CLAUDE.md` equivalent) |
 | `AGENTS.md` | project-level notes Codex also loads (cage, layout) |
-| `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
+| `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker`, `verifier` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
+| `.codex/hooks/` | end-result verifier: `verify.py` (Stop + `update_goal` hook), `verifier_prompt.md`, `verify_test.py`; `state/` (round counters) git-ignored |
 | `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
 | `.codex/models.json` | generated catalog (`npm run models`) |
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
@@ -201,7 +202,7 @@ source (`CLAUDE_SKILLS_DIR`, default `~/.claude/skills`). Requires Linux with La
 (kernel ≥ 5.13; ≥ 6.7 for `CODEX_NET=restricted`) and Node ≥ 20.
 
 Not committed (see `.gitignore`): `.codex/secrets.env`, sessions, sqlite state, router
-log/pid, `node_modules`.
+log/pid, `node_modules`, the `veikkaus-browser` skill copy, and `.codex/hooks/state/`.
 
 ## MCP servers
 
