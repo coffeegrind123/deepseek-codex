@@ -129,9 +129,12 @@ was down is caught up on the next daemon start unless the day is already recorde
 gets one same-day retry after 15 min. Daemon and per-run logs live in `.codex/logs/veikkaus-daily/`
 (kept 90 days). `run-now` counts as the day's run.
 
-`codex-schedule` and `scripts/veikkaus-daily.sh` are **git-ignored in this repo** (local-only, like
-the `.codex/skills/veikkaus-browser` checkout itself), so a fresh clone runs without them and the
-`./codex` ensure step is a no-op there.
+The runner lives in the **skill repo**, at
+`.codex/skills/veikkaus-browser/scripts/veikkaus-daily.sh` and `.../scripts/codex-schedule`, on its
+`deepseek` branch — versioned with the skill it drives. This repo keeps only git-ignored shims at
+`scripts/veikkaus-daily.sh` and `./codex-schedule`, which exist so the container entry script, the
+pidfile liveness check and the `./codex` ensure call keep their paths. A fresh clone has neither,
+so the `./codex` ensure step is a no-op there.
 
 #### Surviving Docker Desktop restarts (the `veikkaus-scheduler` container)
 
