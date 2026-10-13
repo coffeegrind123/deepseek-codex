@@ -75,14 +75,90 @@ idle, with an optional token budget:
 The status line reports `Goal paused / stalled / hit usage limits (/goal resume)` when it
 needs you. Cap budgets with `goals.max_goal_token_budget` in `config.toml`.
 
-#### Usage-limit hold (dormant)
+#### Usage-limit hold (GLM only)
 
 The router can swallow an upstream's "usage limit reached" SSE failure, keep Codex's
 stream alive with `router.hold` heartbeats, and re-send the request once the window
-resets, so a goal never parks as `UsageLimited`. It was built for z.ai's 5-hour GLM
-window and is off now: DeepSeek is pay-as-you-go with no such window. A route opts in
-with `"usageLimit": { "enabled": true, ... }` in `routes.json` (see `router/router.mjs`,
+resets, so a goal never parks as `UsageLimited`. It is on for the `zai` route (z.ai's
+5-hour GLM window) and off for DeepSeek, which is pay-as-you-go. A route opts in with
+`"usageLimit": { "enabled": true, ... }` in `routes.json` (see `router/router.mjs`,
 `DEFAULT_USAGE_LIMIT`; covered by `npm test`).
+
+### Daily skill automation
+
+`./codex-schedule` keeps the **veikkaus-browser** skill running unattended once a day at
+**08:00 Europe/Helsinki** (`VEIKKAUS_RUN_AT=HH:MM` / `VEIKKAUS_TZ` override). Each run is exactly
+what a human would type in this folder:
+
+```sh
+./codex exec -m deepseek-flash --skip-git-repo-check --cd /home/claudeuser/codex '$veikkaus-browser' </dev/null
+```
+
+The model is pinned with `-m` (`VEIKKAUS_MODEL`, default `deepseek-flash`) and must stay that way:
+without it the unattended run reads `.codex/config.toml`, which the TUI rewrites on every `/model`
+switch, so a `glm-5.3` pick at the keyboard silently moved the job onto the z.ai plan — on
+2026-10-13 that run burned the plan's 5-hour quota in 16 minutes and the router held the request
+for 4h45m, pushing the day's screening to ~14:41. A run is also capped at `VEIKKAUS_RUN_TIMEOUT`
+seconds (default 4h, `0` disables), so a wedged run releases the run lock instead of blocking the
+same-day retry and the next slot.
+
+A killed run does not take its work with it. The skill detaches its batch pipeline with `setsid`,
+so it survives the run's TERM, reparents to pid 1, and keeps driving the shared Chrome — and a
+second run's pipeline would then race it for the browser and `/tmp/vb-logs/*` (a wrong-result
+failure, not a crash). So every run sweeps orphaned pipelines first, and again after one that was
+killed: matched on argv against the skill's pipeline scripts with the cwd pinned to the skill
+checkout, session leaders killed by process group, `VEIKKAUS_REAP_GRACE` seconds (default 10) of
+TERM before escalating to KILL. The reaps appear in the daemon log, and
+`./codex-schedule reap [--dry-run]` reports or reaps on demand.
+
+The container has no cron and no systemd (pid 1 is bash), so the schedule is a detached daemon
+(`scripts/veikkaus-daily.sh`) in the same pidfile-verified style as `codex-router`, not a crontab.
+The `./codex` wrapper calls `codex-schedule ensure` on every invocation, so the schedule re-arms
+itself after a container restart (opt out with `CODEX_SCHEDULE=off`).
+
+```sh
+./codex-schedule status              # running? next run? last result? exact command
+./codex-schedule run-now             # run one session now (counts as the day's run)
+./codex-schedule run-now --dry-run   # print the invocation without running it
+./codex-schedule stop | start        # stop sets a flag; an active run finishes first
+```
+
+Behaviour: one run at a time (`flock`, so a still-running pipeline never overlaps the next slot);
+one attempt per day, recorded in `.codex/veikkaus-daily.state`; a slot missed while the container
+was down is caught up on the next daemon start unless the day is already recorded; a failed run
+gets one same-day retry after 15 min. Daemon and per-run logs live in `.codex/logs/veikkaus-daily/`
+(kept 90 days). `run-now` counts as the day's run.
+
+`codex-schedule` and `scripts/veikkaus-daily.sh` are **git-ignored in this repo** (local-only, like
+the `.codex/skills/veikkaus-browser` checkout itself), so a fresh clone runs without them and the
+`./codex` ensure step is a no-op there.
+
+#### Surviving Docker Desktop restarts (the `veikkaus-scheduler` container)
+
+The daemon above lives inside this container, and this container has `restart=no`. So killing
+Docker Desktop — or stopping this container — silently ends the schedule: nothing brings the daemon
+back, and nothing runs `./codex` to re-arm it. To fix that without depending on this container at
+all, the run is owned by a **separate, always-restarting container**:
+
+```sh
+./scripts/veikkaus-scheduler-container.sh ensure    # create + start (idempotent)
+./scripts/veikkaus-scheduler-container.sh status | logs | restart | rm
+```
+
+`ensure` creates `veikkaus-scheduler` from the same image (`claude-code:latest`), with
+`--restart unless-stopped`, mounting the **same host path** at `/home/claudeuser` and the Docker
+socket — so paths, secrets, the skill checkout and the state files are shared, and every command
+the skill runs behaves identically. Docker Desktop restarts it automatically; its entry
+(`scripts/veikkaus-scheduler-entry.sh`) brings up Xvfb, then supervises the daemon, retrying until
+it can take the shared daemon lock, so a slot missed while everything was down is caught up.
+
+Because the state file and the `flock` locks are on the shared mount, two daemons (here and in the
+scheduler container) still run the job **at most once per day**. While the scheduler container is
+up, `./codex-schedule` here refuses to start a competing daemon — `status` reports
+`owned by the veikkaus-scheduler container` — and `ensure` hands the run over (it stops any local
+daemon so the scheduler can take the lock). Remove the container and the in-container daemon takes
+over again on the next `./codex`. Both scheduler scripts are git-ignored, like the rest of the
+daily automation.
 
 ### Subagents
 
@@ -91,6 +167,11 @@ reasoning, `default`/`worker` at `high`, `explorer` at `low`). `.codex/AGENTS.md
 ("Delegate to subagents by default") and the role descriptions in `config.toml` push the
 orchestrator to fan work out: explorers for reading, workers for disjoint chunks of
 implementation, `default` for anything else self-contained.
+
+**GLM-5.3 (opt-in).** `/model` in the TUI also lists `glm-5.3` (z.ai GLM Coding Plan,
+needs `ZAI_API_KEY` in `.codex/secrets.env`); for one run, `./codex -m glm-5.3`. That
+switches only the orchestrator: roles are pinned to `deepseek-flash`, so subagents and
+the verifier stay on DeepSeek.
 
 At most 15 subagents are open at once (`agents.max_concurrent_threads_per_session`);
 the orchestrator is told a user-stated number wins. To actually allow more in a run:
@@ -151,6 +232,7 @@ Logic tests: `python3 .codex/hooks/verify_test.py`.
 
 ```sh
 ./codex-router status | logs | restart     # router health, request log, restart after key changes
+./codex-schedule status | start | stop     # daily veikkaus-browser run (08:00 Europe/Helsinki)
 ./codex mcp list                           # MCP servers as Codex sees them
 ./codex debug models                       # the catalog Codex loaded
 ./codex debug prompt-input                 # what the model actually receives (AGENTS.md etc.)
@@ -161,7 +243,8 @@ CODEX_NET=restricted ./codex               # TCP limited to the router port (bre
 
 ```
 ./codex ──► codex-router ensure ──► router/router.mjs :8877 (outside the cage)
-   │                                     └─ deepseek-* ──► https://api.deepseek.com     (DEEPSEEK_API_KEY)
+   │                                     ├─ deepseek-* ──► https://api.deepseek.com     (DEEPSEEK_API_KEY)
+   │                                     └─ glm-*      ──► https://api.z.ai/api/v1      (ZAI_API_KEY, /model only)
    └─► sandbox/landlock-exec.py --rw . --rw /tmp ... ──► node_modules/.bin/codex
             (kernel policy inherited by subagents, MCP servers, every shell command)
 ```
@@ -170,9 +253,8 @@ CODEX_NET=restricted ./codex               # TCP limited to the router port (bre
 `model` but not a provider (`codex-rs/core/src/agent/role.rs`, `AgentRoleOverrides`).
 The router is the single provider and picks the upstream from each request's `model`.
 Pre-0.149 community setups put `[model_providers.*]` inside the role TOML; that stopped
-working in 0.149+, which is why the router exists. With DeepSeek as the only upstream it
-stays: per-request logging, body rewrites, and a second upstream is one `routes.json`
-entry away.
+working in 0.149+, which is why the router exists. It also gives per-request logging,
+body rewrites, and the GLM usage-limit hold.
 
 **Why Landlock and not Codex's sandbox.** Codex's Linux sandbox is bubblewrap and needs
 user namespaces; this container's seccomp profile denies them (`unshare -Ur` → EPERM) and
@@ -191,12 +273,14 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/AGENTS.md` | the only instructions file (Codex's `~/.claude/CLAUDE.md` equivalent): agentic prompt + this workspace's cage, models and layout |
 | `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker`, `verifier` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
 | `.codex/hooks/` | end-result verifier: `verify.py` (Stop + `update_goal` hook), `verifier_prompt.md`, `verify_test.py`; `state/` (round counters) git-ignored |
-| `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
+| `codex-schedule` | control for the daily unattended run: `start\|stop\|status\|ensure\|logs\|run-now` (git-ignored, local-only) |
+| `scripts/veikkaus-daily.sh` | the daily daemon: sleeps to 08:00 Europe/Helsinki, runs `./codex exec '$veikkaus-browser'`, one attempt/day + catch-up/retry; logs in `.codex/logs/veikkaus-daily/` (git-ignored, local-only) |
+| `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry, default), `glm-5.3.json` (opt-in via `/model`), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
 | `.codex/models.json` | generated catalog (`npm run models`) |
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
 | `.codex/secrets.env` | API keys + router token, mode 600, git-ignored |
 | `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re`; `veikkaus-browser` is a separate copy (its own git checkout, `.env` and state), git-ignored here |
-| `router/routes.json` | model prefix → upstream table, per-route `usageLimit` hold policy (off) |
+| `router/routes.json` | model prefix → upstream table (`deepseek-*`, `glm-*`), per-route `usageLimit` hold policy (on for `glm-*`) |
 | `setup.sh` | reproduce on a fresh clone; `--check` verifies |
 
 Machine-specific paths that `setup.sh` does not manage: the `ghidra` MCP launcher

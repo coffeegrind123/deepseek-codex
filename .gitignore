@@ -3,6 +3,7 @@ node_modules/
 .codex/router.log
 .codex/router.pid
 .codex/sessions/
+.codex/session_index.jsonl
 .codex/tmp/
 .codex/.tmp/
 .codex/*.sqlite*
@@ -24,6 +25,19 @@ sandbox-test/
 .codex/models_cache.json
 .codex/*.lock
 .codex/thread-writer-locks/
+
+# veikkaus-browser daily automation — personal, local-only, like the skill checkout above
+# (setup.sh clones the skill; neither it nor the daily runner are part of this repo).
+codex-schedule
+scripts/veikkaus-daily.sh
+scripts/veikkaus-scheduler-container.sh
+scripts/veikkaus-scheduler-entry.sh
+.codex/veikkaus-daily.pid
+.codex/veikkaus-daily.state
+.codex/veikkaus-daily.lock
+.codex/veikkaus-daily-run.lock
+.codex/veikkaus-daily.stop
+.codex/logs/
 
 # Unrelated work that shares this folder — never part of the workspace repo.
 /.tmp/

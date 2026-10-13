@@ -12,6 +12,12 @@ CAGE="$ROOT/sandbox/landlock-exec.py"
 
 "$ROOT/codex-router" ensure >/dev/null
 
+# Keep the daily veikkaus-browser run armed across container restarts (README "Daily skill
+# automation"). Idempotent, quiet and fails open; disable with CODEX_SCHEDULE=off.
+if [[ "${CODEX_SCHEDULE:-auto}" != "off" && -x "$ROOT/codex-schedule" ]]; then
+  "$ROOT/codex-schedule" ensure >/dev/null 2>&1 || true
+fi
+
 set -a
 # shellcheck disable=SC1091
 . "$ROOT/.codex/secrets.env"
