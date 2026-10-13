@@ -4,7 +4,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS="$ROOT/.codex/secrets.env"
-PID_FILE="$ROOT/.codex/router.pid"
+# PID_FILE is overridable per container: the daily `veikkaus-scheduler` container runs its
+# own copy of ./codex, and two routers sharing one pidfile would each read the other's pid
+# (invisible across PID namespaces) as dead and clobber the file.
+PID_FILE="${CODEX_ROUTER_PIDFILE:-$ROOT/.codex/router.pid}"
 LOG_FILE="$ROOT/.codex/router.log"
 ROUTER="$ROOT/router/router.mjs"
 HEALTH_ATTEMPTS=40

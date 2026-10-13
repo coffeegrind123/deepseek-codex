@@ -46,10 +46,12 @@ if [[ ! -f "$SECRETS" ]]; then
   (( CHECK_ONLY )) && die "$SECRETS missing"
   umask 077
   read -r -p "  DEEPSEEK_API_KEY (sk-...): " ds
+  read -r -p "  ZAI_API_KEY (optional, for /model glm-5.3; 32hex.16chars): " zai
   token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   cat >"$SECRETS" <<EOS
 # Loaded by ./codex and ./codex-router. Never commit this file.
 DEEPSEEK_API_KEY=$ds
+ZAI_API_KEY=$zai
 # Shared secret between Codex and the local router (generated at setup).
 CODEX_ROUTER_TOKEN=$token
 CODEX_ROUTER_PORT=8877
@@ -63,6 +65,7 @@ for var in DEEPSEEK_API_KEY CODEX_ROUTER_TOKEN; do
   [[ -n "${!var:-}" && "${!var}" != *'<'* ]] || die "$var not set in $SECRETS"
 done
 ok "secrets present, mode $(stat -c %a "$SECRETS")"
+[[ -n "${ZAI_API_KEY:-}" && "$ZAI_API_KEY" != *'<'* ]] || warn "ZAI_API_KEY not set; /model glm-5.3 will fail with 502"
 
 printf '== config paths\n'
 # The trusted-project key must be this clone's absolute path.
@@ -125,7 +128,9 @@ probe() {
     -H "Authorization: Bearer $CODEX_ROUTER_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"model\":\"$model\",\"input\":\"Reply OK\",\"stream\":true,\"max_output_tokens\":16}"
 }
-for model in deepseek-flash; do
+models=(deepseek-flash)
+[[ -n "${ZAI_API_KEY:-}" && "$ZAI_API_KEY" != *'<'* ]] && models+=(glm-5.3)
+for model in "${models[@]}"; do
   code="$(probe "$model")"
   [[ "$code" == 200 ]] && ok "$model -> HTTP $code" || warn "$model -> HTTP $code (see .codex/router.log)"
 done

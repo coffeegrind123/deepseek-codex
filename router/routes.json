@@ -5,6 +5,13 @@
       "match": "deepseek-",
       "base": "https://api.deepseek.com",
       "keyEnv": "DEEPSEEK_API_KEY"
+    },
+    {
+      "name": "zai",
+      "match": "glm-",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
     }
   ]
 }
