@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_NAME="@openai/codex"
+NPM_CACHE="${CODEX_NPM_CACHE:-/tmp/codex-npm-cache}"
+BUILD_VERSION="${CODEX_UPDATE_VERSION:-latest}"
+CHECK_ONLY=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./codex-update [--check] [VERSION]
+       ./codex update [--check] [VERSION]
+
+Update the workspace-local Codex CLI to the latest npm release, or to an
+explicit version such as 0.163.0.
+
+Options:
+  --check       Show installed, pinned, and latest versions without changing files
+  -h, --help    Show this help
+
+If a workspace Codex process is running, the update asks whether to stop it first.
+EOF
+}
+
+die() {
+  printf 'codex-update: %s\n' "$*" >&2
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage >&2
+      exit 2
+      ;;
+    *)
+      BUILD_VERSION="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ "$BUILD_VERSION" != "latest" && ! "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  die "invalid version: $BUILD_VERSION"
+fi
+
+command -v node >/dev/null || die "node is not installed"
+command -v npm >/dev/null || die "npm is not installed"
+command -v flock >/dev/null || die "flock is not installed"
+
+cd "$ROOT"
+export NPM_CONFIG_CACHE="$NPM_CACHE"
+
+manifest_version() {
+  node -e '
+    const pkg = require(process.argv[1]);
+    process.stdout.write(pkg.dependencies?.["@openai/codex"] ?? "");
+  ' "$ROOT/package.json"
+}
+
+installed_version() {
+  node -e '
+    try {
+      process.stdout.write(require(process.argv[1]).version);
+    } catch {}
+  ' "$ROOT/node_modules/@openai/codex/package.json"
+}
+
+latest_version() {
+  npm view "$PACKAGE_NAME" version --silent
+}
+
+active_workspace_codex() {
+  local description pid
+  while IFS=$'\t' read -r pid description; do
+    printf '  pid %s  %s\n' "$pid" "$description"
+  done < <(workspace_codex_processes)
+}
+
+process_is_zombie() {
+  local state
+  state="$(awk '/^State:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null || true)"
+  [[ "$state" == "Z" ]]
+}
+
+workspace_codex_processes() {
+  local arg argv0 cmdline exe pid target seen=" "
+  local -a argv=()
+
+  for exe in /proc/[0-9]*/exe; do
+    target="$(readlink "$exe" 2>/dev/null || true)"
+    case "$target" in
+      "$ROOT/node_modules/@openai/"*)
+        pid="${exe#/proc/}"
+        pid="${pid%/exe}"
+        process_is_zombie "$pid" && continue
+        printf '%s\t%s\n' "$pid" "$target"
+        seen+="$pid "
+        ;;
+    esac
+  done
+
+  for cmdline in /proc/[0-9]*/cmdline; do
+    pid="${cmdline#/proc/}"
+    pid="${pid%/cmdline}"
+    [[ "$seen" == *" $pid "* ]] && continue
+    [[ -r "$cmdline" ]] || continue
+    mapfile -d '' -t argv < "$cmdline" 2>/dev/null || true
+    argv0="${argv[0]:-}"
+
+    case "$argv0" in
+      "$ROOT/node_modules/@openai/"*)
+        process_is_zombie "$pid" && continue
+        printf '%s\t%s\n' "$pid" "${argv[*]}"
+        seen+="$pid "
+        continue
+        ;;
+    esac
+
+    case "${argv0##*/}" in
+      node|nodejs)
+        for arg in "${argv[@]:1}"; do
+          case "$arg" in
+            "$ROOT/node_modules/.bin/codex"|"$ROOT/node_modules/@openai/"*)
+              process_is_zombie "$pid" && break
+              printf '%s\t%s\n' "$pid" "${argv[*]}"
+              seen+="$pid "
+              break
+              ;;
+          esac
+        done
+        ;;
+    esac
+  done
+}
+
+terminate_workspace_codex() {
+  local attempt pid
+  local -a pids=()
+
+  mapfile -t pids < <(workspace_codex_processes | cut -f1)
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  printf 'Stopping %s Codex process(es)...\n' "${#pids[@]}"
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    mapfile -t pids < <(workspace_codex_processes | cut -f1)
+    [[ "${#pids[@]}" -eq 0 ]] && { printf 'Codex processes stopped.\n'; return 0; }
+    sleep 0.1
+  done
+
+  printf 'Processes did not stop after SIGTERM; sending SIGKILL...\n'
+  kill -KILL "${pids[@]}" 2>/dev/null || true
+
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    mapfile -t pids < <(workspace_codex_processes | cut -f1)
+    [[ "${#pids[@]}" -eq 0 ]] && { printf 'Codex processes force-stopped.\n'; return 0; }
+    sleep 0.1
+  done
+
+  die "could not stop all running ./codex sessions"
+}
+
+confirm_kill_active_codex() {
+  local answer
+
+  printf 'Kill these Codex processes automatically and continue? [y/N] '
+  if ! IFS= read -r answer; then
+    printf '\n'
+    die "update cancelled; close all running ./codex sessions and retry"
+  fi
+
+  case "${answer,,}" in
+    y|yes)
+      terminate_workspace_codex
+      ;;
+    *)
+      die "update cancelled; close all running ./codex sessions and retry"
+      ;;
+  esac
+}
+
+LATEST="$(latest_version)" || die "could not query npm for the latest $PACKAGE_NAME version"
+[[ -n "$LATEST" ]] || die "npm returned an empty latest version"
+
+TARGET="$BUILD_VERSION"
+[[ "$TARGET" == "latest" ]] && TARGET="$LATEST"
+
+MANIFEST="$(manifest_version)"
+INSTALLED="$(installed_version)"
+
+printf 'Manifest pin: %s\n' "${MANIFEST:-missing}"
+printf 'Installed:    %s\n' "${INSTALLED:-missing}"
+printf 'Latest npm:   %s\n' "$LATEST"
+printf 'Target:       %s\n' "$TARGET"
+
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+  LOCK_FILE="/tmp/codex-update-$(printf '%s' "$ROOT" | sha256sum | cut -c1-12).lock"
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "another Codex update is already running"
+fi
+
+ACTIVE="$(active_workspace_codex)"
+if [[ -n "$ACTIVE" ]]; then
+  printf 'Active Codex processes for this workspace:\n%s\n' "$ACTIVE"
+else
+  printf 'Active Codex processes for this workspace: none\n'
+fi
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  if [[ "$MANIFEST" == "$LATEST" && "$INSTALLED" == "$LATEST" ]]; then
+    printf 'Status:       up to date\n'
+  else
+    printf 'Status:       update available; run ./codex update\n'
+  fi
+  exit 0
+fi
+
+if [[ -n "$ACTIVE" ]]; then
+  confirm_kill_active_codex
+fi
+
+if [[ "$MANIFEST" == "$TARGET" && "$INSTALLED" == "$TARGET" ]]; then
+  printf 'Dependencies already match %s; verifying installation.\n' "$TARGET"
+else
+  mkdir -p "$NPM_CACHE"
+  BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-update-backup.XXXXXX")"
+  cp package.json "$BACKUP_DIR/package.json"
+  if [[ -f package-lock.json ]]; then
+    cp package-lock.json "$BACKUP_DIR/package-lock.json"
+  fi
+
+  printf 'Installing %s@%s...\n' "$PACKAGE_NAME" "$TARGET"
+  if ! npm install --save-exact --no-audit --no-fund "$PACKAGE_NAME@$TARGET"; then
+    cp "$BACKUP_DIR/package.json" package.json
+    if [[ -f "$BACKUP_DIR/package-lock.json" ]]; then
+      cp "$BACKUP_DIR/package-lock.json" package-lock.json
+    fi
+    die "npm install failed; package manifests restored from $BACKUP_DIR"
+  fi
+fi
+
+MANIFEST="$(manifest_version)"
+INSTALLED="$(installed_version)"
+[[ "$MANIFEST" == "$TARGET" ]] || die "package.json pins $MANIFEST, expected $TARGET"
+[[ "$INSTALLED" == "$TARGET" ]] || die "node_modules contains $INSTALLED, expected $TARGET"
+
+printf 'Running workspace tests...\n'
+npm test
+
+printf 'Verifying local CLI...\n'
+CLI_VERSION="$("$ROOT/node_modules/.bin/codex" --version)"
+[[ "$CLI_VERSION" == "codex-cli $TARGET" ]] || die "local CLI reports '$CLI_VERSION', expected 'codex-cli $TARGET'"
+
+printf 'Verifying workspace wrapper...\n'
+WRAPPER_VERSION="$(CODEX_SCHEDULE=off "$ROOT/codex" --version)"
+[[ "$WRAPPER_VERSION" == "codex-cli $TARGET" ]] || die "wrapper reports '$WRAPPER_VERSION', expected 'codex-cli $TARGET'"
+
+printf 'Updated and verified: %s\n' "$WRAPPER_VERSION"

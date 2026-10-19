@@ -8,6 +8,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$ROOT/node_modules/.bin/codex"
 CAGE="$ROOT/sandbox/landlock-exec.py"
 
+# Project-local update path: ./codex update
+if [[ "${1:-}" == "update" ]]; then
+  shift
+  exec "$ROOT/codex-update" "$@"
+fi
+
 [[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
 
 "$ROOT/codex-router" ensure >/dev/null

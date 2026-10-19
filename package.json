@@ -5,11 +5,12 @@
   "description": "Folder-restricted OpenAI Codex CLI: DeepSeek Flash orchestrator and subagents",
   "scripts": {
     "codex": "./codex",
+    "update:codex": "./codex-update",
     "router": "node router/router.mjs",
     "models": "node scripts/build-models.mjs",
     "test": "node --test router/router.test.mjs"
   },
   "dependencies": {
-    "@openai/codex": "0.158.0"
+    "@openai/codex": "0.163.0"
   }
 }

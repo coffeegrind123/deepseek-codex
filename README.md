@@ -22,6 +22,19 @@ npm run models               regenerate .codex/models.json from .codex/catalog/
 ./codex --help                   # every arg is passed straight to codex
 ```
 
+### Updating
+
+```sh
+./codex update                   # update the workspace-local CLI to the latest npm release
+./codex update --check           # show pinned, installed, and latest versions
+./codex update 0.163.0           # install an exact version
+```
+
+The npm cache is redirected to `/tmp/codex-npm-cache` so the update works inside this
+container's Landlock policy. If a workspace Codex process is still running, the script
+asks before stopping it, then waits for a clean exit and force-stops any remaining
+process. `./codex-update` is the equivalent standalone entry point.
+
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with this folder as cwd and `CODEX_HOME`.
 
