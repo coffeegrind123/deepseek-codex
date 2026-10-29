@@ -440,6 +440,23 @@ scripts/         model, balance and hook utilities
                  skills/, secrets.env (never commit), sessions/, logs
 ```
 
+## Private and public repositories
+
+This checkout is the public, sanitized distribution of the Codex workspace. Development
+also happens in a separate private source repository. The two intentionally have
+unrelated Git histories.
+
+- Treat `origin/main` as this repository's upstream.
+- Make public-facing changes here when they are intended for distribution, but never
+  commit private data, credentials, local-only configuration, or personal information.
+- Port shared changes from the private source as file-level edits in a sanitized
+  publication update. Do not merge, pull, or push private history into this repository.
+- Changes made here that belong in the private workspace must be ported back after
+  review; do not assume a direct merge is possible.
+- Shared behavior and instructions must remain consistent across both repositories.
+  When editing this file, preserve the common rules and change only repository-specific
+  operational details.
+
 ---
 
 # Workflow
