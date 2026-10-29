@@ -1,0 +1,951 @@
+#!/usr/bin/env node
+// Local model router for Codex.
+//
+// Codex only supports ONE model_provider per session, and agent roles can override
+// `model` but not `model_provider` (codex-rs/core/src/agent/role.rs, AgentRoleOverrides).
+// So Codex points at this process and the router picks the upstream from the `model`
+// field of each request (router/routes.json). DeepSeek is the default; GLM is opt-in
+// via /model:
+//
+//   Codex ──► 127.0.0.1:PORT/v1/responses ──┬─ deepseek-* ──► https://api.deepseek.com/responses
+//             (Authorization: router token) └─ glm-*      ──► https://api.z.ai/api/v1/responses
+//
+// The usage-limit hold below is for z.ai's GLM Coding Plan window; any route that sets
+// `usageLimit.enabled` gets it.
+//
+// The router swaps the bearer token for the upstream key, streams the body back
+// untouched (SSE passthrough), and logs one line per request with raw evidence.
+// Everything it needs comes from the environment (see .codex/secrets.env).
+
+import http from 'node:http';
+import https from 'node:https';
+import { URL } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { timingSafeEqual } from 'node:crypto';
+
+const HTTP_OK = 200;
+const HTTP_BAD_REQUEST = 400;
+const HTTP_UNAUTHORIZED = 401;
+const HTTP_NOT_FOUND = 404;
+const HTTP_METHOD_NOT_ALLOWED = 405;
+const HTTP_PAYLOAD_TOO_LARGE = 413;
+const HTTP_UNPROCESSABLE = 422;
+const HTTP_BAD_GATEWAY = 502;
+const HTTP_GATEWAY_TIMEOUT = 504;
+
+const DEFAULT_PORT = 8877;
+const BIND_HOST = '127.0.0.1';
+// Codex prompts carry the whole context window; 1M tokens of UTF-8 stays well under this.
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+// Upstream socket silence tolerated before the request is failed. Codex has its own
+// stream_idle_timeout_ms; this only guards against half-open sockets it cannot see.
+const DEFAULT_UPSTREAM_IDLE_MS = 600_000;
+const SOFT_ERROR_CAPTURE_BYTES = 1024 * 1024;
+// Policy failures arrive before model text, but streams can contain several metadata
+// events first. Keep this bounded so a malformed stream cannot hold the client forever.
+const SNIFF_MAX_BYTES = 16 * 1024;
+const MAX_FALLBACK_HOPS = 8;
+const FALLBACK_POLICY_CODES = new Set(['cyber_policy', 'bio_policy', 'invalid_prompt']);
+const DEFAULT_USAGE_LIMIT = {
+  enabled: false,
+  // z.ai prints the reset time in Asia/Shanghai local time with no zone marker.
+  resetTzOffsetMinutes: 480,
+  maxHoldMs: 6 * 60 * 60 * 1000,
+  pollMs: 5 * 60 * 1000,
+  heartbeatMs: 10 * 1000,
+  // When the reset time is unknown or already past, retry on a doubling backoff capped at pollMs.
+  retryBaseMs: 30 * 1000,
+  resetSlackMs: 5 * 1000,
+};
+const HEALTH_PATH = '/health';
+const ROUTES_PATH = '/routes';
+// Hop-by-hop headers must not be forwarded (RFC 9110 §7.6.1); the rest are rewritten.
+const DROPPED_REQUEST_HEADERS = new Set([
+  'host', 'authorization', 'connection', 'keep-alive', 'proxy-authorization',
+  'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length',
+]);
+const DROPPED_RESPONSE_HEADERS = new Set([
+  'connection', 'keep-alive', 'transfer-encoding', 'content-length',
+]);
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Route table. Order matters: first prefix match wins.
+ * `keyEnv` names the environment variable holding the upstream API key so keys never
+ * appear in this file or in logs. `base` is the upstream prefix that replaces
+ * Codex's provider base_url (`.../v1`).
+ */
+function loadRoutes() {
+  const routesFile = process.env.CODEX_ROUTER_ROUTES ?? path.join(here, 'routes.json');
+  const raw = fs.readFileSync(routesFile, 'utf8');
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed.routes) || parsed.routes.length === 0) {
+    throw new Error(`${routesFile}: "routes" must be a non-empty array`);
+  }
+  const routes = parsed.routes.map((route, index) => {
+    for (const field of ['name', 'match', 'base', 'keyEnv']) {
+      if (typeof route[field] !== 'string' || route[field].length === 0) {
+        throw new Error(`${routesFile}: routes[${index}].${field} must be a non-empty string`);
+      }
+    }
+    const base = new URL(route.base);
+    if (base.protocol !== 'https:' && base.protocol !== 'http:') {
+      throw new Error(`${routesFile}: routes[${index}].base must be http(s)`);
+    }
+    return {
+      name: route.name,
+      match: route.match,
+      base,
+      keyEnv: route.keyEnv,
+      // Optional per-upstream request rewrites, applied to the parsed JSON body.
+      drop: Array.isArray(route.dropFields) ? route.dropFields : [],
+      set: typeof route.setFields === 'object' && route.setFields !== null ? route.setFields : {},
+      fallbackModel: typeof route.fallbackModel === 'string' && route.fallbackModel.length > 0
+        ? route.fallbackModel
+        : null,
+      // Optional: swallow "usage limit reached" failures and retry after the window resets,
+      // keeping Codex's stream open with SSE comments so a running goal never pauses.
+      usageLimit: { ...DEFAULT_USAGE_LIMIT, ...(route.usageLimit ?? {}) },
+    };
+  });
+  for (const route of routes) {
+    if (route.fallbackModel && !routes.some((candidate) => route.fallbackModel.startsWith(candidate.match))) {
+      throw new Error(`${routesFile}: fallbackModel "${route.fallbackModel}" for route "${route.name}" has no matching route`);
+    }
+  }
+  return routes;
+}
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`environment variable ${name} is not set (source .codex/secrets.env)`);
+  }
+  return value;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+class Logger {
+  constructor(file) {
+    this.stream = file ? fs.createWriteStream(file, { flags: 'a' }) : null;
+  }
+
+  line(fields) {
+    const text = `${nowIso()} ${Object.entries(fields)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join(' ')}`;
+    if (this.stream) {
+      this.stream.write(`${text}\n`);
+      return;
+    }
+    process.stdout.write(`${text}\n`);
+  }
+}
+
+function sendJson(res, status, body) {
+  const payload = Buffer.from(JSON.stringify(body));
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': payload.length,
+  });
+  res.end(payload);
+}
+
+/** Codex-style error envelope so the CLI renders the message instead of a raw status. */
+function sendError(res, status, code, message, extra = {}) {
+  sendJson(res, status, { error: { type: code, code, message, ...extra } });
+}
+
+function deliverCapturedResponse(res, status, headers, body) {
+  if (!res.headersSent) {
+    res.writeHead(status, headers);
+  }
+  res.end(body);
+}
+
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('request body too large'), { status: HTTP_PAYLOAD_TOO_LARGE }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function constantTimeEquals(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    return false;
+  }
+  return timingSafeEqual(bufA, bufB);
+}
+
+function bearerToken(req) {
+  const header = req.headers.authorization ?? '';
+  const [scheme, token] = header.split(' ', 2);
+  if (!scheme || scheme.toLowerCase() !== 'bearer' || !token) {
+    return null;
+  }
+  return token.trim();
+}
+
+function selectRoute(routes, model) {
+  return routes.find((route) => model.startsWith(route.match)) ?? null;
+}
+
+/**
+ * Strip Codex's provider prefix so `/v1/responses` becomes `/responses` before it is
+ * appended to the upstream base. The base already carries whatever version segment
+ * the upstream wants (`/api/v1` for z.ai, none for DeepSeek).
+ */
+function upstreamUrl(base, requestUrl) {
+  const incoming = new URL(requestUrl, 'http://router.invalid');
+  const relative = incoming.pathname.replace(/^\/v1(?=\/|$)/, '');
+  const basePath = base.pathname.replace(/\/$/, '');
+  const target = new URL(base.toString());
+  target.pathname = `${basePath}${relative}`;
+  target.search = incoming.search;
+  return target;
+}
+
+function applyRewrites(route, body) {
+  if (route.drop.length === 0 && Object.keys(route.set).length === 0) {
+    return null;
+  }
+  for (const field of route.drop) {
+    delete body[field];
+  }
+  Object.assign(body, route.set);
+  return Buffer.from(JSON.stringify(body));
+}
+
+/**
+ * Recognise z.ai's 5-hour-window exhaustion in the first SSE event:
+ *   event: response.failed
+ *   data: {"response":{"error":{"code":"rate_limit_exceeded","message":"Usage limit reached
+ *          for 5 hour. Your limit will reset at 2026-09-20 10:10:23[...]"}, ...}}
+ * Returns { resetAt: epoch ms | null, message } or null when the event is something else.
+ */
+export function parseUsageLimitEvent(eventText, policy = DEFAULT_USAGE_LIMIT) {
+  const dataLine = eventText.split('\n').find((line) => line.startsWith('data:'));
+  if (!dataLine) {
+    return null;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(dataLine.slice(5).trim());
+  } catch {
+    return null;
+  }
+  const error = payload?.response?.error ?? payload?.error ?? (payload?.type === 'error' ? payload : null);
+  const code = error?.code ?? error?.type;
+  if (code !== 'rate_limit_exceeded' && code !== 'usage_limit_reached') {
+    return null;
+  }
+  const message = String(error?.message ?? 'usage limit reached');
+  const match = message.match(/reset at (\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+  let resetAt = null;
+  if (match) {
+    const [, y, mo, d, h, mi, s] = match.map(Number);
+    resetAt = Date.UTC(y, mo - 1, d, h, mi, s) - policy.resetTzOffsetMinutes * 60 * 1000;
+  }
+  return { resetAt, message };
+}
+
+/**
+ * Keep Codex's stream alive until the deadline. Codex's stream_idle_timeout_ms counts
+ * time between parsed SSE *events* (codex-api/src/sse/responses.rs), so comment lines do
+ * not help; send a real event with an unknown `type`, which Codex logs and ignores.
+ */
+function heartbeat(res, waitMs, everyMs, until, cancelled) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + waitMs;
+    const tick = () => {
+      if (cancelled() || Date.now() >= deadline) {
+        resolve();
+        return;
+      }
+      res.write(`event: router.hold\ndata: ${JSON.stringify({ type: 'router.hold', until })}\n\n`);
+      setTimeout(tick, Math.min(everyMs, Math.max(0, deadline - Date.now())));
+    };
+    tick();
+  });
+}
+
+/** Map an upstream 200-with-error body to an HTTP status Codex can act on. */
+function classifySoftError(text) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: HTTP_BAD_GATEWAY, message: `expected text/event-stream, got: ${text.slice(0, 200)}` };
+  }
+  const code = Number(parsed?.code ?? parsed?.error?.code ?? parsed?.error?.status);
+  const status = Number.isInteger(code) && code >= 400 && code <= 599 ? code : HTTP_BAD_GATEWAY;
+  const message = parsed?.msg ?? parsed?.message ?? parsed?.error?.message ?? text.slice(0, 200);
+  return { status, message: String(message) };
+}
+
+function isContentRiskError(text) {
+  try {
+    const message = JSON.parse(text)?.error?.message;
+    return typeof message === 'string' && /\bContent Exists Risk\b/i.test(message);
+  } catch {
+    return false;
+  }
+}
+
+function fallbackNodeKey(route, model) {
+  return `${route.name}\0${model}`;
+}
+
+function validateFallbackGraph(routes) {
+  const routeNames = new Set();
+  for (const route of routes) {
+    if (routeNames.has(route.name)) {
+      throw new Error(`duplicate route name "${route.name}"`);
+    }
+    routeNames.add(route.name);
+  }
+
+  const visiting = new Set();
+  const visited = new Set();
+  const visitNode = (route, model, pathParts) => {
+    const nodeKey = fallbackNodeKey(route, model);
+    if (visiting.has(nodeKey)) {
+      throw new Error(`fallback cycle: ${[...pathParts, `${route.name}:${model}`].join(' -> ')}`);
+    }
+    if (visited.has(nodeKey)) {
+      return;
+    }
+    visiting.add(nodeKey);
+    if (route.fallbackModel) {
+      const next = selectRoute(routes, route.fallbackModel);
+      if (!next) {
+        throw new Error(`fallbackModel "${route.fallbackModel}" for route "${route.name}" has no matching route`);
+      }
+      visitNode(next, route.fallbackModel, [...pathParts, `${route.name}:${model}`]);
+    }
+    visiting.delete(nodeKey);
+    visited.add(nodeKey);
+  };
+
+  for (const route of routes) {
+    if (!route.fallbackModel) {
+      continue;
+    }
+    const next = selectRoute(routes, route.fallbackModel);
+    if (!next) {
+      throw new Error(`fallbackModel "${route.fallbackModel}" for route "${route.name}" has no matching route`);
+    }
+    visitNode(next, route.fallbackModel, []);
+  }
+}
+
+function findSseBoundary(buffer) {
+  for (let i = 0; i < buffer.length - 1; i += 1) {
+    if (buffer[i] === 10 && buffer[i + 1] === 10) {
+      return i + 2;
+    }
+    if (
+      buffer[i] === 13 && buffer[i + 1] === 10
+      && buffer[i + 2] === 13 && buffer[i + 3] === 10
+    ) {
+      return i + 4;
+    }
+    if (buffer[i] === 13 && buffer[i + 1] === 13) {
+      return i + 2;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Parse one SSE frame for policy failures and model output. A provider may name the
+ * event in the `event:` field, the JSON `type`, or both.
+ */
+function classifySseFrame(frame) {
+  const lines = frame.toString('utf8').replace(/\r\n?/g, '\n').split('\n');
+  let eventName = null;
+  const dataLines = [];
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const dataText = dataLines.join('\n');
+  let payload = null;
+  try {
+    payload = JSON.parse(dataText);
+  } catch {
+    // Fall through: some providers send an event name plus a non-JSON error body.
+  }
+  const type = eventName ?? payload?.type ?? payload?.response?.type ?? null;
+  const error = payload?.response?.error ?? payload?.error
+    ?? (payload?.type === 'error' ? payload : null);
+  const code = error?.code == null ? null : String(error.code);
+  const isFailure = type === 'response.failed' || type === 'error'
+    || payload?.type === 'response.failed' || payload?.type === 'error'
+    || Boolean(error);
+  const contentRisk = isFailure && /\bContent Exists Risk\b/i.test(dataText);
+  const policyCode = isFailure && code && FALLBACK_POLICY_CODES.has(code.toLowerCase())
+    ? code.toLowerCase()
+    : null;
+  const isImmediateOutput = !isFailure && (
+    /^response\.(?:output_text|reasoning_(?:summary_)?text|function_call_arguments|refusal)\.delta$/.test(type ?? '')
+    || ['response.completed', 'response.done'].includes(type)
+  );
+
+  return {
+    type,
+    payload,
+    code,
+    isPolicyFailure: Boolean(policyCode || contentRisk),
+    policyCode: policyCode ?? (contentRisk ? 'content_exists_risk' : null),
+    isImmediateOutput,
+  };
+}
+
+function forwardHeaders(req, apiKey, contentLength) {
+  const headers = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (!DROPPED_REQUEST_HEADERS.has(name.toLowerCase())) {
+      headers[name] = value;
+    }
+  }
+  headers.authorization = `Bearer ${apiKey}`;
+  headers['content-length'] = String(contentLength);
+  return headers;
+}
+
+export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_IDLE_MS }) {
+  validateFallbackGraph(routes);
+  const startedAt = nowIso();
+  let inFlight = 0;
+  let served = 0;
+  const holds = new Map();
+
+  async function handle(req, res) {
+    const requestUrl = new URL(req.url, 'http://router.invalid');
+
+    if (req.method === 'GET' && requestUrl.pathname === HEALTH_PATH) {
+      sendJson(res, HTTP_OK, { ok: true, startedAt, inFlight, served, pid: process.pid, holds: [...holds.values()] });
+      return;
+    }
+
+    if (req.method === 'GET' && requestUrl.pathname === ROUTES_PATH) {
+      sendJson(res, HTTP_OK, {
+        routes: routes.map((r) => ({
+          name: r.name, match: r.match, base: r.base.toString(), keyEnv: r.keyEnv,
+          keyPresent: Boolean(process.env[r.keyEnv]), fallbackModel: r.fallbackModel,
+        })),
+      });
+      return;
+    }
+
+    const presented = bearerToken(req);
+    if (presented === null || !constantTimeEquals(presented, token)) {
+      logger.line({ event: 'reject', reason: 'bad-router-token', path: requestUrl.pathname, from: req.socket.remoteAddress });
+      sendError(res, HTTP_UNAUTHORIZED, 'router_unauthorized',
+        'router token mismatch: CODEX_ROUTER_TOKEN in the Codex environment must equal the one the router was started with');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      sendError(res, HTTP_METHOD_NOT_ALLOWED, 'router_method_not_allowed',
+        `router only forwards POST requests carrying a "model" field; got ${req.method} ${requestUrl.pathname}`);
+      return;
+    }
+
+    let rawBody;
+    try {
+      rawBody = await readBody(req, MAX_BODY_BYTES);
+    } catch (err) {
+      sendError(res, err.status ?? HTTP_BAD_REQUEST, 'router_body_error', err.message);
+      return;
+    }
+
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString('utf8'));
+    } catch (err) {
+      logger.line({ event: 'reject', reason: 'non-json', path: requestUrl.pathname, size: rawBody.length });
+      sendError(res, HTTP_BAD_REQUEST, 'router_invalid_json', `request body is not JSON: ${err.message}`);
+      return;
+    }
+
+    const model = typeof body?.model === 'string' ? body.model : null;
+    if (!model) {
+      logger.line({ event: 'reject', reason: 'no-model', path: requestUrl.pathname, keys: Object.keys(body ?? {}) });
+      sendError(res, HTTP_UNPROCESSABLE, 'router_missing_model', 'request has no "model" field; the router cannot choose an upstream');
+      return;
+    }
+
+    const route = selectRoute(routes, model);
+    if (!route) {
+      logger.line({ event: 'reject', reason: 'unrouted-model', model, known: routes.map((r) => r.match) });
+      sendError(res, HTTP_NOT_FOUND, 'router_unknown_model',
+        `no route for model "${model}". Known prefixes: ${routes.map((r) => `${r.match}* -> ${r.name}`).join(', ')}`);
+      return;
+    }
+
+    const apiKey = process.env[route.keyEnv];
+    if (!apiKey) {
+      logger.line({ event: 'reject', reason: 'missing-upstream-key', model, route: route.name, keyEnv: route.keyEnv });
+      sendError(res, HTTP_BAD_GATEWAY, 'router_missing_upstream_key',
+        `route ${route.name} needs ${route.keyEnv} in the router's environment`);
+      return;
+    }
+
+    let activeRoute = route;
+    let activeModel = model;
+    const buildBody = (targetRoute, targetModel) => {
+      const nextBody = JSON.parse(rawBody.toString('utf8'));
+      nextBody.model = targetModel;
+      return applyRewrites(targetRoute, nextBody) ?? Buffer.from(JSON.stringify(nextBody));
+    };
+    let activeBody = buildBody(route, model);
+    let activeTarget = upstreamUrl(activeRoute.base, req.url);
+    const stream = body.stream === true;
+    const started = Date.now();
+    let activeTransport = activeTarget.protocol === 'https:' ? https : http;
+    let activeApiKey = apiKey;
+    inFlight += 1;
+
+    let bytesOut = 0;
+    let finished = false;
+    let attempts = 0;
+    let heldMs = 0;
+    const fallbackChain = [model];
+    let fallbackHops = 0;
+    const visited = new Set([fallbackNodeKey(route, model)]);
+    const finish = (fields) => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      inFlight -= 1;
+      served += 1;
+      logger.line({
+        event: 'proxy', model, route: activeRoute.name, path: activeTarget.pathname, stream,
+        ms: Date.now() - started, reqBytes: activeBody.length, resBytes: bytesOut,
+        ...(fallbackChain.length > 1 ? { fallbackChain: fallbackChain.join(' -> ') } : {}),
+        ...(attempts > 1 ? { attempts, heldMs } : {}), ...fields,
+      });
+    };
+
+    let clientGone = false;
+    let activeUpstream = null;
+    let upstreamStatus = null;
+    // Codex aborting (interrupt, retry) must release the upstream connection too. `res`
+    // 'close' is the reliable signal: once the body has been consumed, `req` may stay
+    // silent, and a paused pipe into a dead socket never reaches 'end' on the upstream.
+    res.on('close', () => {
+      clientGone = true;
+      if (!finished) {
+        activeUpstream?.destroy(new Error('client closed'));
+        finish({ status: upstreamStatus ?? HTTP_BAD_GATEWAY, error: 'client closed before upstream finished' });
+      }
+    });
+
+    /**
+     * One upstream attempt. Resolves to:
+     *   { kind: 'done' }                              body delivered or final error sent
+     *   { kind: 'usage-limit', resetAt, message }     window exhausted; nothing sent yet
+     *   { kind: 'policy-failure', status, headers, body, reason, code }
+     *                                                 inspectable provider rejection
+     * SSE frames are sniffed only until output begins or the bounded window fills.
+     */
+    const attemptUpstream = () => new Promise((resolve) => {
+      attempts += 1;
+      const requestHeaders = forwardHeaders(req, activeApiKey, activeBody.length);
+      const upstream = activeTransport.request(activeTarget, { method: 'POST', headers: requestHeaders });
+      activeUpstream = upstream;
+
+      upstream.setTimeout(idleMs, () => {
+        upstream.destroy(Object.assign(new Error(`upstream idle for ${idleMs} ms`), { code: 'ROUTER_IDLE' }));
+      });
+
+      upstream.on('response', (up) => {
+        upstreamStatus = up.statusCode;
+        const contentType = String(up.headers['content-type'] ?? '');
+        const isSse = contentType.startsWith('text/event-stream');
+        const headers = {};
+        for (const [name, value] of Object.entries(up.headers)) {
+          if (!DROPPED_RESPONSE_HEADERS.has(name.toLowerCase())) {
+            headers[name] = value;
+          }
+        }
+        let settled = false;
+        let passthroughStarted = false;
+        let sniffing = false;
+        const sniff = [];
+        let sniffTotalBytes = 0;
+        let scanOffset = 0;
+
+        const settle = (outcome, abortUpstream = false) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          sniffing = false;
+          if (abortUpstream) {
+            up.destroy();
+          }
+          resolve(outcome);
+        };
+
+        const startPassthrough = (initial = Buffer.alloc(0)) => {
+          passthroughStarted = true;
+          if (!res.headersSent) {
+            res.writeHead(up.statusCode, headers);
+          } else if (up.statusCode !== HTTP_OK) {
+            // Headers already went out as 200 during a hold; the only channel left is SSE.
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'router_upstream_error', message: `${activeRoute.name} returned HTTP ${up.statusCode} after a usage-limit hold` })}\n\n`);
+          }
+          if (initial.length > 0) {
+            res.write(initial);
+          }
+          up.pipe(res);
+        };
+
+        const finishPassthrough = () => {
+          if (passthroughStarted && !settled) {
+            finish({ status: up.statusCode });
+            settle({ kind: 'done' });
+          }
+        };
+
+        // A Content Exists Risk 400 may be chunked. Capture up to the bound; once the
+        // body proves larger or is not a policy failure, forward every captured byte.
+        const canFallbackNow = () => !clientGone && !res.headersSent && Boolean(activeRoute.fallbackModel);
+        if (up.statusCode === HTTP_BAD_REQUEST && canFallbackNow()) {
+          const contentLength = Number(up.headers['content-length']);
+          if (Number.isFinite(contentLength) && contentLength > SOFT_ERROR_CAPTURE_BYTES) {
+            startPassthrough();
+            up.on('end', finishPassthrough);
+          } else {
+            const chunks = [];
+            let capturedBytes = 0;
+            let capturing = true;
+            up.on('data', (chunk) => {
+              bytesOut += chunk.length;
+              upstream.setTimeout(idleMs);
+              if (!capturing) {
+                return;
+              }
+              if (capturedBytes + chunk.length > SOFT_ERROR_CAPTURE_BYTES) {
+                capturing = false;
+                startPassthrough(Buffer.concat([...chunks, chunk]));
+                chunks.length = 0;
+                return;
+              }
+              chunks.push(chunk);
+              capturedBytes += chunk.length;
+            });
+            up.on('end', () => {
+              if (settled) {
+                return;
+              }
+              if (!capturing) {
+                finishPassthrough();
+                return;
+              }
+              const body = Buffer.concat(chunks);
+              const text = body.toString('utf8');
+              if (isContentRiskError(text)) {
+                settle({
+                  kind: 'policy-failure', status: up.statusCode, headers, body,
+                  reason: 'content-risk', code: 'content_exists_risk',
+                }, true);
+                return;
+              }
+              deliverCapturedResponse(res, up.statusCode, headers, body);
+              finish({ status: up.statusCode });
+              settle({ kind: 'done' });
+            });
+          }
+        } else if (stream && up.statusCode === HTTP_OK && !isSse) {
+          // z.ai answers some failures (bad key, quota) with HTTP 200 and a JSON body.
+          const chunks = [];
+          let size = 0;
+          up.on('data', (chunk) => {
+            if (size < SOFT_ERROR_CAPTURE_BYTES) {
+              chunks.push(chunk);
+              size += chunk.length;
+            }
+          });
+          up.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8').slice(0, SOFT_ERROR_CAPTURE_BYTES);
+            const { status, message } = classifySoftError(text);
+            bytesOut = size;
+            finish({ status, softError: true, upstreamError: text.slice(0, 2048) });
+            sendError(res, status, 'router_upstream_soft_error', `${activeRoute.name}: ${message}`);
+            settle({ kind: 'done' });
+          });
+        } else {
+          sniffing = stream && isSse && up.statusCode === HTTP_OK;
+          if (sniffing) {
+            up.on('data', (chunk) => {
+              bytesOut += chunk.length;
+              upstream.setTimeout(idleMs);
+              sniff.push(chunk);
+              sniffTotalBytes += chunk.length;
+
+              while (sniffing) {
+                const remaining = Buffer.concat(sniff).subarray(scanOffset);
+                const boundary = findSseBoundary(remaining);
+                if (boundary === -1) {
+                  break;
+                }
+                const frameEnd = scanOffset + boundary;
+                const frame = Buffer.concat(sniff).subarray(scanOffset, frameEnd);
+                scanOffset = frameEnd;
+                const event = classifySseFrame(frame);
+                if (!event) {
+                  continue;
+                }
+                if (event.isPolicyFailure) {
+                  settle({
+                    kind: 'policy-failure', status: up.statusCode, headers,
+                    body: Buffer.concat(sniff), reason: 'sse-policy', code: event.policyCode,
+                  }, true);
+                  return;
+                }
+                if (activeRoute.usageLimit.enabled) {
+                  const limit = parseUsageLimitEvent(frame.toString('utf8'), activeRoute.usageLimit);
+                  if (limit) {
+                    settle({ kind: 'usage-limit', ...limit }, true);
+                    return;
+                  }
+                }
+                if (event.isImmediateOutput) {
+                  sniffing = false;
+                  startPassthrough(Buffer.concat(sniff));
+                  return;
+                }
+              }
+
+              if (sniffing && sniffTotalBytes >= SNIFF_MAX_BYTES) {
+                sniffing = false;
+                startPassthrough(Buffer.concat(sniff));
+              }
+            });
+          } else {
+            startPassthrough();
+          }
+
+          up.on('end', () => {
+            if (settled) {
+              return;
+            }
+            if (sniffing) {
+              sniffing = false;
+              startPassthrough(Buffer.concat(sniff));
+            }
+            finishPassthrough();
+          });
+        }
+
+        up.on('error', (err) => {
+          if (settled) {
+            return;
+          }
+          finish({ status: up.statusCode, error: `upstream body: ${err.message}` });
+          if (!res.headersSent) {
+            sendError(res, HTTP_BAD_GATEWAY, 'router_upstream_error', err.message);
+          } else {
+            res.destroy();
+          }
+          settle({ kind: 'done' });
+        });
+        // A client abort mid-stream tears the upstream down without 'end' or 'error'; 'close'
+        // always fires, so it is the accounting backstop.
+        up.on('close', () => {
+          if (!settled && passthroughStarted) {
+            finish({ status: up.statusCode, error: 'stream closed before end' });
+            settle({ kind: 'done' });
+          } else if (!settled) {
+            settle({ kind: 'done' });
+          }
+        });
+      });
+
+      upstream.on('error', (err) => {
+        const timedOut = err.code === 'ROUTER_IDLE';
+        finish({ status: timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, error: err.message });
+        if (!res.headersSent) {
+          sendError(res, timedOut ? HTTP_GATEWAY_TIMEOUT : HTTP_BAD_GATEWAY, 'router_upstream_error',
+            `${activeRoute.name} (${activeTarget.host}): ${err.message}`);
+        } else {
+          res.destroy();
+        }
+        resolve({ kind: 'done' });
+      });
+
+      upstream.end(activeBody);
+    });
+
+    const holdStarted = Date.now();
+    for (;;) {
+      const outcome = await attemptUpstream();
+      if (outcome.kind === 'policy-failure' && !clientGone) {
+        const fallbackModel = activeRoute.fallbackModel;
+        const fallbackRoute = fallbackModel ? selectRoute(routes, fallbackModel) : null;
+        const fallbackApiKey = fallbackRoute ? process.env[fallbackRoute.keyEnv] : null;
+        const nextNode = fallbackRoute ? fallbackNodeKey(fallbackRoute, fallbackModel) : null;
+        let blockedReason = null;
+        if (res.headersSent || clientGone) {
+          blockedReason = 'client-output-started';
+        } else if (!fallbackModel) {
+          blockedReason = 'no-fallback-configured';
+        } else if (!fallbackRoute) {
+          blockedReason = 'no-fallback-route';
+        } else if (!fallbackApiKey) {
+          blockedReason = 'missing-upstream-key';
+        } else if (visited.has(nextNode)) {
+          blockedReason = 'fallback-cycle';
+        } else if (fallbackHops >= MAX_FALLBACK_HOPS) {
+          blockedReason = 'max-fallback-hops';
+        }
+
+        if (!blockedReason) {
+          logger.line({
+            event: 'fallback', model, from: activeRoute.name, to: fallbackRoute.name,
+            fallbackModel, reason: outcome.reason, policyCode: outcome.code,
+            hop: fallbackHops + 1,
+          });
+          activeRoute = fallbackRoute;
+          activeModel = fallbackModel;
+          activeApiKey = fallbackApiKey;
+          activeBody = buildBody(activeRoute, activeModel);
+          activeTarget = upstreamUrl(activeRoute.base, req.url);
+          activeTransport = activeTarget.protocol === 'https:' ? https : http;
+          fallbackChain.push(activeModel);
+          fallbackHops += 1;
+          visited.add(nextNode);
+          continue;
+        }
+
+        logger.line({
+          event: 'fallback-blocked', model, route: activeRoute.name,
+          reason: blockedReason, policyCode: outcome.code, fallbackModel: fallbackModel ?? null,
+        });
+        deliverCapturedResponse(res, outcome.status, outcome.headers, outcome.body);
+        finish({
+          status: outcome.status,
+          policyCode: outcome.code,
+          fallbackError: blockedReason,
+        });
+        return;
+      }
+      if (outcome.kind !== 'usage-limit' || clientGone) {
+        return;
+      }
+      const policy = activeRoute.usageLimit;
+      const elapsed = Date.now() - holdStarted;
+      const remaining = policy.maxHoldMs - elapsed;
+      let waitMs = outcome.resetAt ? outcome.resetAt + policy.resetSlackMs - Date.now() : 0;
+      if (waitMs <= 0) {
+        waitMs = Math.min(policy.pollMs, policy.retryBaseMs * 2 ** (attempts - 1));
+      }
+      waitMs = Math.min(waitMs, remaining);
+      if (remaining <= 0) {
+        // Out of patience: hand Codex the failure exactly as the upstream phrased it.
+        finish({ status: 429, usageLimit: true, heldMs: elapsed, upstreamError: outcome.message });
+        if (!res.headersSent) {
+          res.writeHead(HTTP_OK, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        }
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'rate_limit_exceeded', message: outcome.message })}\n\n`);
+        res.end();
+        return;
+      }
+      if (!res.headersSent) {
+        res.writeHead(HTTP_OK, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.flushHeaders();
+      }
+      const until = new Date(Date.now() + waitMs).toISOString();
+      holds.set(res, { model: activeModel, route: activeRoute.name, since: new Date(holdStarted).toISOString(), until, attempts });
+      logger.line({ event: 'hold', model: activeModel, route: activeRoute.name, until, waitMs, attempt: attempts, upstreamError: outcome.message });
+      await heartbeat(res, waitMs, policy.heartbeatMs, until, () => clientGone);
+      holds.delete(res);
+      heldMs += waitMs;
+      if (clientGone) {
+        return;
+      }
+    }
+  }
+
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((err) => {
+      logger.line({ event: 'internal-error', error: err.stack ?? String(err) });
+      if (!res.headersSent) {
+        sendError(res, HTTP_BAD_GATEWAY, 'router_internal_error', err.message);
+      } else {
+        res.destroy();
+      }
+    });
+  });
+  server.stats = () => ({ inFlight, served });
+  return server;
+}
+
+function main() {
+  const routes = loadRoutes();
+  const token = requireEnv('CODEX_ROUTER_TOKEN');
+  const port = Number(process.env.CODEX_ROUTER_PORT ?? DEFAULT_PORT);
+  const idleMs = Number(process.env.CODEX_ROUTER_IDLE_MS ?? DEFAULT_UPSTREAM_IDLE_MS);
+  const logger = new Logger(process.env.CODEX_ROUTER_LOG ?? null);
+
+  for (const route of routes) {
+    if (!process.env[route.keyEnv]) {
+      logger.line({ event: 'warn', message: `${route.keyEnv} unset; requests for ${route.match}* will fail with 502` });
+    }
+  }
+
+  const server = createRouter({ routes, token, logger, idleMs });
+  server.keepAliveTimeout = 65_000;
+  server.requestTimeout = 0;
+  server.headersTimeout = 60_000;
+
+  server.listen(port, BIND_HOST, () => {
+    logger.line({
+      event: 'listen', url: `http://${BIND_HOST}:${port}/v1`, pid: process.pid,
+      routes: routes.map((r) => `${r.match}* -> ${r.name} (${r.base})`),
+    });
+  });
+
+  const shutdown = (signal) => {
+    logger.line({ event: 'shutdown', signal, ...server.stats() });
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
+}

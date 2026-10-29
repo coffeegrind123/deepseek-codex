@@ -1,0 +1,30 @@
+{
+  "description": "Show a human-readable subagent task label when a child starts.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(spawn_agent|Agent)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CODEX_HOME/../plugins/subagent-labels/scripts/subagent-start.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Labeling subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CODEX_HOME/../plugins/subagent-labels/scripts/subagent-start.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Naming subagent"
+          }
+        ]
+      }
+    ]
+  }
+}

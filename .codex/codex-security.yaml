@@ -1,0 +1,34 @@
+# Codex Security CLI (`cs`) project file, selected by ./cs via CODEX_SECURITY_PROJECT_CONFIG.
+# cs runs scans in its own isolated Codex home and ignores config.toml, so the router
+# provider is restated here. Without it, scans default to gpt-5.6-sol on OpenAI.
+# api-key: cs otherwise looks for a ChatGPT login; ./cs passes the router token as CODEX_API_KEY.
+auth: api-key
+scan:
+  # The ./cs wrapper supplies mode-specific --max-time defaults because 0.6.0
+  # treats scan.max_time_minutes and scan.deep.max_time_hours as one setting.
+  deep:
+    workers: 2
+    subagents_per_worker: 1
+    stop_after_no_new: 3
+    stop_after_consecutive_errors: 2
+    max_discovery_runs: 10
+    max_time_hours: 1.5
+codex:
+  model: deepseek-flash
+  model_reasoning_effort: high
+  model_provider: router
+  model_catalog_json: /home/claudeuser/codex/.codex/models.json
+  web_search: disabled
+  analytics:
+    enabled: false
+  model_providers:
+    router:
+      name: "Local router: DeepSeek V4.1 Flash"
+      base_url: http://127.0.0.1:8877/v1
+      env_key: CODEX_ROUTER_TOKEN
+      wire_api: responses
+      requires_openai_auth: false
+      supports_websockets: false
+      request_max_retries: 4
+      stream_max_retries: 5
+      stream_idle_timeout_ms: 300000

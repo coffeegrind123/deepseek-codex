@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_NAME="@openai/codex"
+NPM_CACHE="${CODEX_NPM_CACHE:-/tmp/codex-npm-cache}"
+BUILD_VERSION="${CODEX_UPDATE_VERSION:-latest}"
+CHECK_ONLY=0
+
+STAGE_DIR=""
+ROLLBACK_DIR=""
+PROMOTION_STARTED=0
+PROMOTION_FINISHED=0
+BACKED_UP_NODE_MODULES=0
+BACKED_UP_PACKAGE_JSON=0
+BACKED_UP_PACKAGE_LOCK=0
+PROMOTED_NODE_MODULES=0
+PROMOTED_PACKAGE_JSON=0
+PROMOTED_PACKAGE_LOCK=0
+
+cleanup() {
+  local status="$?"
+  trap - EXIT
+
+  if [[ "$PROMOTION_STARTED" -eq 1 && "$PROMOTION_FINISHED" -eq 0 ]]; then
+    if ! rollback_promotion; then
+      printf 'codex-update: rollback incomplete; backup retained at %s\n' "$ROLLBACK_DIR" >&2
+    fi
+  fi
+
+  if [[ -n "$STAGE_DIR" && -e "$STAGE_DIR" ]]; then
+    rm -rf -- "$STAGE_DIR"
+  fi
+  if [[ "$PROMOTION_FINISHED" -eq 1 && -n "$ROLLBACK_DIR" && -e "$ROLLBACK_DIR" ]]; then
+    rm -rf -- "$ROLLBACK_DIR"
+  fi
+
+  exit "$status"
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'EOF'
+Usage: ./codex-update [--check] [VERSION]
+       ./codex update [--check] [VERSION]
+
+Update the workspace-local Codex CLI to the latest npm release, or to an
+explicit version such as 0.163.0.
+
+Options:
+  --check       Show installed, pinned, and latest versions without changing files
+  -h, --help    Show this help
+
+The candidate is installed and verified in a workspace staging directory. If
+workspace Codex processes are active, the update asks whether to stop them only
+after that verification and immediately before promotion.
+EOF
+}
+
+die() {
+  printf 'codex-update: %s\n' "$*" >&2
+  exit 1
+}
+
+remove_path() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    rm -rf -- "$path"
+  fi
+}
+
+rollback_promotion() {
+  local ok=1
+  local restore_node_modules=1
+  local restore_package_json=1
+  local restore_package_lock=1
+
+  [[ "$PROMOTION_STARTED" -eq 1 ]] || return 0
+  [[ -n "$ROLLBACK_DIR" ]] || return 1
+
+  if [[ "$PROMOTED_NODE_MODULES" -eq 1 ]]; then
+    remove_path "$ROOT/node_modules" || { restore_node_modules=0; ok=0; }
+  fi
+  if [[ "$PROMOTED_PACKAGE_JSON" -eq 1 ]]; then
+    remove_path "$ROOT/package.json" || { restore_package_json=0; ok=0; }
+  fi
+  if [[ "$PROMOTED_PACKAGE_LOCK" -eq 1 ]]; then
+    remove_path "$ROOT/package-lock.json" || { restore_package_lock=0; ok=0; }
+  fi
+
+  if [[ "$BACKED_UP_NODE_MODULES" -eq 1 && "$restore_node_modules" -eq 1 ]]; then
+    mv -- "$ROLLBACK_DIR/node_modules" "$ROOT/node_modules" || ok=0
+  fi
+  if [[ "$BACKED_UP_PACKAGE_JSON" -eq 1 && "$restore_package_json" -eq 1 ]]; then
+    mv -- "$ROLLBACK_DIR/package.json" "$ROOT/package.json" || ok=0
+  fi
+  if [[ "$BACKED_UP_PACKAGE_LOCK" -eq 1 && "$restore_package_lock" -eq 1 ]]; then
+    mv -- "$ROLLBACK_DIR/package-lock.json" "$ROOT/package-lock.json" || ok=0
+  fi
+
+  [[ "$ok" -eq 1 ]] || return 1
+
+  PROMOTION_STARTED=0
+  PROMOTED_NODE_MODULES=0
+  PROMOTED_PACKAGE_JSON=0
+  PROMOTED_PACKAGE_LOCK=0
+  BACKED_UP_NODE_MODULES=0
+  BACKED_UP_PACKAGE_JSON=0
+  BACKED_UP_PACKAGE_LOCK=0
+  rm -rf -- "$ROLLBACK_DIR"
+  ROLLBACK_DIR=""
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage >&2
+      exit 2
+      ;;
+    *)
+      BUILD_VERSION="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ "$BUILD_VERSION" != "latest" && ! "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  die "invalid version: $BUILD_VERSION"
+fi
+
+command -v node >/dev/null || die "node is not installed"
+command -v npm >/dev/null || die "npm is not installed"
+command -v flock >/dev/null || die "flock is not installed"
+
+cd "$ROOT"
+export NPM_CONFIG_CACHE="$NPM_CACHE"
+
+manifest_version() {
+  node -e '
+    try {
+      const pkg = require(process.argv[1]);
+      process.stdout.write(pkg.dependencies?.["@openai/codex"] ?? "");
+    } catch {}
+  ' "$1"
+}
+
+installed_version() {
+  node -e '
+    try {
+      process.stdout.write(require(process.argv[1]).version);
+    } catch {}
+  ' "$1"
+}
+
+lock_version() {
+  node -e '
+    try {
+      const lock = require(process.argv[1]);
+      process.stdout.write(
+        lock.packages?.[""]?.dependencies?.["@openai/codex"] ??
+        lock.dependencies?.["@openai/codex"]?.version ??
+        "",
+      );
+    } catch {}
+  ' "$1"
+}
+
+latest_version() {
+  npm view "$PACKAGE_NAME" version --silent
+}
+
+active_workspace_codex() {
+  local description pid
+  while IFS=$'\t' read -r pid description; do
+    printf '  pid %s  %s\n' "$pid" "$description"
+  done < <(workspace_codex_processes)
+}
+
+process_is_zombie() {
+  local state
+  state="$(awk '/^State:/ {print $2; exit}' "/proc/$1/status" 2>/dev/null || true)"
+  [[ "$state" == "Z" ]]
+}
+
+workspace_codex_processes() {
+  local arg argv0 cmdline exe pid target seen=" "
+  local -a argv=()
+
+  for exe in /proc/[0-9]*/exe; do
+    target="$(readlink "$exe" 2>/dev/null || true)"
+    case "$target" in
+      "$ROOT/node_modules/@openai/"*)
+        pid="${exe#/proc/}"
+        pid="${pid%/exe}"
+        process_is_zombie "$pid" && continue
+        printf '%s\t%s\n' "$pid" "$target"
+        seen+="$pid "
+        ;;
+    esac
+  done
+
+  for cmdline in /proc/[0-9]*/cmdline; do
+    pid="${cmdline#/proc/}"
+    pid="${pid%/cmdline}"
+    [[ "$seen" == *" $pid "* ]] && continue
+    [[ -r "$cmdline" ]] || continue
+    mapfile -d '' -t argv < "$cmdline" 2>/dev/null || true
+    argv0="${argv[0]:-}"
+
+    case "$argv0" in
+      "$ROOT/node_modules/@openai/"*)
+        process_is_zombie "$pid" && continue
+        printf '%s\t%s\n' "$pid" "${argv[*]}"
+        seen+="$pid "
+        continue
+        ;;
+    esac
+
+    case "${argv0##*/}" in
+      node|nodejs)
+        for arg in "${argv[@]:1}"; do
+          case "$arg" in
+            "$ROOT/node_modules/.bin/codex"|"$ROOT/node_modules/@openai/"*)
+              process_is_zombie "$pid" && break
+              printf '%s\t%s\n' "$pid" "${argv[*]}"
+              seen+="$pid "
+              break
+              ;;
+          esac
+        done
+        ;;
+    esac
+  done
+}
+
+terminate_workspace_codex() {
+  local attempt pid
+  local -a pids=()
+
+  mapfile -t pids < <(workspace_codex_processes | cut -f1)
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  printf 'Stopping %s Codex process(es)...\n' "${#pids[@]}"
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    mapfile -t pids < <(workspace_codex_processes | cut -f1)
+    [[ "${#pids[@]}" -eq 0 ]] && { printf 'Codex processes stopped.\n'; return 0; }
+    sleep 0.1
+  done
+
+  printf 'Processes did not stop after SIGTERM; sending SIGKILL...\n'
+  kill -KILL "${pids[@]}" 2>/dev/null || true
+
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    mapfile -t pids < <(workspace_codex_processes | cut -f1)
+    [[ "${#pids[@]}" -eq 0 ]] && { printf 'Codex processes force-stopped.\n'; return 0; }
+    sleep 0.1
+  done
+
+  die "could not stop all running ./codex sessions"
+}
+
+confirm_kill_active_codex() {
+  local answer
+
+  printf 'Kill these Codex processes automatically and continue? [y/N] '
+  if ! IFS= read -r answer; then
+    printf '\n'
+    die "update cancelled; close all running ./codex sessions and retry"
+  fi
+
+  case "${answer,,}" in
+    y|yes)
+      terminate_workspace_codex
+      ;;
+    *)
+      die "update cancelled; close all running ./codex sessions and retry"
+      ;;
+  esac
+}
+
+verify_live_installation() {
+  local target="$1"
+  local cli_version installed manifest wrapper_version
+
+  manifest="$(manifest_version "$ROOT/package.json")"
+  installed="$(installed_version "$ROOT/node_modules/@openai/codex/package.json")"
+  if [[ "$manifest" != "$target" ]]; then
+    printf 'codex-update: package.json pins %s, expected %s\n' "${manifest:-missing}" "$target" >&2
+    return 1
+  fi
+  if [[ "$installed" != "$target" ]]; then
+    printf 'codex-update: node_modules contains %s, expected %s\n' "${installed:-missing}" "$target" >&2
+    return 1
+  fi
+
+  printf 'Running workspace tests...\n'
+  if ! npm test; then
+    printf 'codex-update: workspace tests failed\n' >&2
+    return 1
+  fi
+
+  printf 'Verifying local CLI...\n'
+  if ! cli_version="$("$ROOT/node_modules/.bin/codex" --version)"; then
+    printf 'codex-update: local CLI could not report its version\n' >&2
+    return 1
+  fi
+  if [[ "$cli_version" != "codex-cli $target" ]]; then
+    printf "codex-update: local CLI reports '%s', expected 'codex-cli %s'\n" "$cli_version" "$target" >&2
+    return 1
+  fi
+
+  printf 'Verifying workspace wrapper...\n'
+  if ! wrapper_version="$(CODEX_SCHEDULE=off "$ROOT/codex" --version)"; then
+    printf 'codex-update: workspace wrapper could not report its version\n' >&2
+    return 1
+  fi
+  if [[ "$wrapper_version" != "codex-cli $target" ]]; then
+    printf "codex-update: wrapper reports '%s', expected 'codex-cli %s'\n" "$wrapper_version" "$target" >&2
+    return 1
+  fi
+
+  printf 'Updated and verified: %s\n' "$wrapper_version"
+}
+
+verify_staged_installation() {
+  local target="$1"
+  local cli_version installed manifest staged_lock
+
+  manifest="$(manifest_version "$STAGE_DIR/package.json")"
+  if [[ "$manifest" != "$target" ]]; then
+    die "staged package.json pins ${manifest:-missing}, expected $target"
+  fi
+
+  installed="$(installed_version "$STAGE_DIR/node_modules/@openai/codex/package.json")"
+  if [[ "$installed" != "$target" ]]; then
+    die "staged node_modules contains ${installed:-missing}, expected $target"
+  fi
+
+  if [[ -f "$ROOT/package-lock.json" && ! -f "$STAGE_DIR/package-lock.json" ]]; then
+    die "staged install did not produce a package-lock.json"
+  fi
+  if [[ -f "$STAGE_DIR/package-lock.json" ]]; then
+    staged_lock="$(lock_version "$STAGE_DIR/package-lock.json")"
+    [[ "$staged_lock" == "$target" ]] \
+      || die "staged package-lock.json pins ${staged_lock:-missing}, expected $target"
+  fi
+
+  [[ -x "$STAGE_DIR/node_modules/.bin/codex" ]] \
+    || die "staged Codex CLI is missing or not executable"
+  if ! cli_version="$("$STAGE_DIR/node_modules/.bin/codex" --version)"; then
+    die "staged Codex CLI could not report its version"
+  fi
+  [[ "$cli_version" == "codex-cli $target" ]] \
+    || die "staged CLI reports '$cli_version', expected 'codex-cli $target'"
+
+  printf 'Staged install verified: %s\n' "$cli_version"
+}
+
+promote_staged_installation() {
+  [[ -d "$STAGE_DIR/node_modules" ]] || return 1
+
+  ROLLBACK_DIR="$(mktemp -d "$ROOT/.codex-update-rollback.XXXXXX")" || return 1
+  PROMOTION_STARTED=1
+
+  if [[ -e "$ROOT/node_modules" ]]; then
+    mv -- "$ROOT/node_modules" "$ROLLBACK_DIR/node_modules" || return 1
+    BACKED_UP_NODE_MODULES=1
+  fi
+  mv -- "$STAGE_DIR/node_modules" "$ROOT/node_modules" || return 1
+  PROMOTED_NODE_MODULES=1
+
+  mv -- "$ROOT/package.json" "$ROLLBACK_DIR/package.json" || return 1
+  BACKED_UP_PACKAGE_JSON=1
+  mv -- "$STAGE_DIR/package.json" "$ROOT/package.json" || return 1
+  PROMOTED_PACKAGE_JSON=1
+
+  if [[ -f "$ROOT/package-lock.json" ]]; then
+    mv -- "$ROOT/package-lock.json" "$ROLLBACK_DIR/package-lock.json" || return 1
+    BACKED_UP_PACKAGE_LOCK=1
+  fi
+  if [[ -f "$STAGE_DIR/package-lock.json" ]]; then
+    mv -- "$STAGE_DIR/package-lock.json" "$ROOT/package-lock.json" || return 1
+    PROMOTED_PACKAGE_LOCK=1
+  fi
+}
+
+LATEST="$(latest_version)" || die "could not query npm for the latest $PACKAGE_NAME version"
+[[ -n "$LATEST" ]] || die "npm returned an empty latest version"
+
+TARGET="$BUILD_VERSION"
+[[ "$TARGET" == "latest" ]] && TARGET="$LATEST"
+
+MANIFEST="$(manifest_version "$ROOT/package.json")"
+INSTALLED="$(installed_version "$ROOT/node_modules/@openai/codex/package.json")"
+
+printf 'Manifest pin: %s\n' "${MANIFEST:-missing}"
+printf 'Installed:    %s\n' "${INSTALLED:-missing}"
+printf 'Latest npm:   %s\n' "$LATEST"
+printf 'Target:       %s\n' "$TARGET"
+
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+  LOCK_FILE="/tmp/codex-update-$(printf '%s' "$ROOT" | sha256sum | cut -c1-12).lock"
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "another Codex update is already running"
+fi
+
+ACTIVE="$(active_workspace_codex)"
+if [[ -n "$ACTIVE" ]]; then
+  printf 'Active Codex processes for this workspace:\n%s\n' "$ACTIVE"
+else
+  printf 'Active Codex processes for this workspace: none\n'
+fi
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  if [[ "$MANIFEST" == "$LATEST" && "$INSTALLED" == "$LATEST" ]]; then
+    printf 'Status:       up to date\n'
+  else
+    printf 'Status:       update available; run ./codex update\n'
+  fi
+  exit 0
+fi
+
+if [[ "$MANIFEST" == "$TARGET" && "$INSTALLED" == "$TARGET" ]]; then
+  printf 'Dependencies already match %s; verifying installation.\n' "$TARGET"
+  verify_live_installation "$TARGET" \
+    || die "live installation verification failed; no files were promoted"
+  exit 0
+fi
+
+mkdir -p "$NPM_CACHE"
+STAGE_DIR="$(mktemp -d "$ROOT/.codex-update-stage.XXXXXX")" \
+  || die "could not create a workspace staging directory"
+cp -- "$ROOT/package.json" "$STAGE_DIR/package.json"
+if [[ -f "$ROOT/package-lock.json" ]]; then
+  cp -- "$ROOT/package-lock.json" "$STAGE_DIR/package-lock.json"
+fi
+
+printf 'Installing %s@%s in staging...\n' "$PACKAGE_NAME" "$TARGET"
+if ! (
+  cd "$STAGE_DIR"
+  npm install --save-exact --no-audit --no-fund "$PACKAGE_NAME@$TARGET"
+); then
+  die "staged install failed; live node_modules, package.json, and package-lock.json were not modified"
+fi
+
+verify_staged_installation "$TARGET"
+
+# Re-read active processes here: sessions may have started or ended during the
+# staged install and verification.
+ACTIVE="$(active_workspace_codex)"
+if [[ -n "$ACTIVE" ]]; then
+  printf 'Active Codex processes for this workspace:\n%s\n' "$ACTIVE"
+  confirm_kill_active_codex
+fi
+
+printf 'Promoting staged Codex installation...\n'
+if ! promote_staged_installation; then
+  if rollback_promotion; then
+    die "promotion failed; the live installation was rolled back"
+  fi
+  die "promotion failed; rollback incomplete and the backup was retained at $ROLLBACK_DIR"
+fi
+
+if ! verify_live_installation "$TARGET"; then
+  if rollback_promotion; then
+    die "post-promotion verification failed; the live installation was rolled back"
+  fi
+  die "post-promotion verification failed; rollback incomplete and the backup was retained at $ROLLBACK_DIR"
+fi
+
+PROMOTION_FINISHED=1
+if ! rm -rf -- "$ROLLBACK_DIR"; then
+  printf 'codex-update: promoted install is verified; rollback backup remains at %s\n' "$ROLLBACK_DIR" >&2
+else
+  ROLLBACK_DIR=""
+fi

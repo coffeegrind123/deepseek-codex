@@ -1,0 +1,211 @@
+# Codex configuration for this workspace. CODEX_HOME points here (set by ./codex), so
+# nothing in ~/.codex is read and sessions/logs/auth stay inside the folder.
+#
+# Model routing: one provider ("router") fronts DeepSeek. The orchestrator and every
+# subagent run on deepseek-flash; the router swaps the local token for the real key and
+# routes by model prefix (router/routes.json), so another upstream can be added later.
+
+model_provider = "router"
+model = "deepseek-flash"
+model_reasoning_effort = "high"
+model_catalog_json = "models.json"
+# Codex's web_search tool is served by OpenAI's backend; DeepSeek does not have it.
+web_search = "disabled"
+
+# Filesystem restriction lives OUTSIDE Codex: ./codex wraps the whole process tree in a
+# Landlock cage (sandbox/landlock-exec.py) that allows writes only under this folder plus
+# the roots listed in .codex/cage.conf. Codex's own Linux sandbox is bubblewrap, which
+# needs user namespaces; this container's seccomp profile denies them (unshare -> EPERM),
+# and the legacy Landlock path panics on 0.155 permission profiles. So Codex is told not
+# to wrap commands itself; the kernel policy inherited from the wrapper is what holds.
+#
+# `never` = yolo by default: the model runs every command without asking. That is safe
+# here only because the Landlock cage, not Codex, bounds what can be written — approvals
+# would gate nothing the cage doesn't already. The end-result verifier still gates
+# completion. Set "on-request" to have the model ask, or override per run with `-a on-request`.
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.router]
+name = "Local router: DeepSeek V4.1 Flash"
+base_url = "http://127.0.0.1:8877/v1"
+env_key = "CODEX_ROUTER_TOKEN"
+env_key_instructions = "Run codex through ./codex so .codex/secrets.env is loaded and the router is started."
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+
+# Remote plugins and apps are ChatGPT-account features (the featured-plugins call 401s here).
+# Local plugins are on for codex-security (marketplace/). On older Codex this blocked startup
+# ~47s on a git fetch of github.com/openai/plugins; on 0.163 it no longer does (measured
+# 2026-10-25, README "Operations").
+[features]
+plugins = true
+remote_plugin = false
+apps = false
+
+# Every spawned agent runs on DeepSeek V4.1 Flash, same as the orchestrator.
+# `default_subagent_model` covers the plain spawn path; the role files cover every role
+# name the orchestrator can pass (default/explorer/worker are the built-ins, redefined
+# here so their model is pinned).
+# The role descriptions below are what the orchestrator sees in the spawn tool, so they
+# carry the "delegate by default" nudge alongside .codex/AGENTS.md.
+[agents]
+enabled = true
+# Hard cap on subagents open at once. The orchestrator is told to fan out aggressively
+# (.codex/AGENTS.md); this is the ceiling. Raise per run with
+# `./codex -c agents.max_concurrent_threads_per_session=N`.
+max_concurrent_threads_per_session = 15
+# The catalog pins multi_agent_version = "v1" on purpose: the v2 backend has no nesting
+# limit and DeepSeek Flash explorers happily spawned explorers five deep
+# (observed 2026-09-20). v1 honours max_depth. Depth counts from the orchestrator (0):
+# 2 allows orchestrator -> agent -> agent; depth-2 agents get no spawn tool.
+max_depth = 2
+default_subagent_model = "deepseek-flash"
+default_subagent_reasoning_effort = "high"
+
+[agents.default]
+description = "General-purpose subagent (DeepSeek V4.1 Flash). Use for any self-contained subtask (research, analysis, a script, a write-up) that no specialised role fits. Delegate rather than doing it inline."
+config_file = "agents/default.toml"
+nickname_candidates = ["General Investigator", "Research Analyst", "Implementation Specialist", "Focused Worker"]
+
+[agents.explorer]
+description = """Use `explorer` for specific codebase questions.
+Explorers are fast and authoritative.
+They must be used to ask specific, well-scoped questions on the codebase.
+Rules:
+- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
+- Spawn explorers by default for any reading that spans more than a couple of files: their context is spent instead of yours. Spawn several in parallel, one per distinct question, in the same turn. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results.
+- Reuse existing explorers for related questions."""
+config_file = "agents/explorer.toml"
+nickname_candidates = ["Codebase Scout", "Call Flow Tracer", "API Surface Scout", "Test Path Scout", "Config Investigator", "Updater Investigator", "Plugin Investigator"]
+
+[agents.worker]
+description = """Use for execution and production work.
+Typical tasks:
+- Implement part of a feature
+- Fix tests or bugs
+- Split large refactors into independent chunks
+Rules:
+- Default to workers for implementation: split the change into independent chunks with disjoint files and spawn one worker per chunk in parallel, then review and integrate their results yourself.
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, clearly specify which files or modules the worker is responsible for to avoid merge conflicts.
+- Always tell workers they are **not alone in the codebase**: they must not revert edits made by others and should adjust their implementation to accommodate changes made by others."""
+config_file = "agents/worker.toml"
+nickname_candidates = ["Implementation Engineer", "Updater Engineer", "Plugin Engineer", "Balance Engineer", "Configuration Engineer", "Test Engineer"]
+
+[agents.verifier]
+description = """Read-only END-RESULT verifier (DeepSeek V4.1 Flash, fresh context). Spawn it to independently confirm a finished task meets the user's ORIGINAL request: it derives the acceptance criteria from that request, re-runs the real build/tests itself, and returns a JSON verdict with per-criterion evidence. It never edits code and never trusts a claim. The same review runs automatically on task/goal completion via the verify.py hook — spawn it by hand only when you want an independent check before then."""
+config_file = "agents/verifier.toml"
+nickname_candidates = ["Independent Reviewer", "Evidence Auditor", "Final Result Verifier"]
+
+[projects."/home/claudeuser/codex"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/vtest"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/vfail"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/vwrap"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/vloop"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/yolo"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/codex/.tmp/y2"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/camoufox"]
+trust_level = "trusted"
+
+[projects."/home/claudeuser/cs2/cs16"]
+trust_level = "trusted"
+
+# Trust the source-controlled project hooks in `.codex/hooks.json`. These hashes
+# are the exact identities reported by the 0.163 `hooks/list` API. Run
+# `./setup.sh --check` after editing either hook; it fails until the hashes are
+# refreshed intentionally.
+[hooks.state."/home/claudeuser/codex/.codex/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:d926e5841eb320e8a277d498cd6b36940ea0bbe13eaf233d825420f82843faab"
+
+[hooks.state."/home/claudeuser/codex/.codex/hooks.json:subagent_start:0:0"]
+trusted_hash = "sha256:0df160ced3ab1001395d71f3ac95a895b81de079258b7951623210853f3fca13"
+
+# End-result verifier hooks: DISABLED. Uncomment the [[hooks...]] tables below to re-enable.
+# End-result verifier hooks (see .codex/hooks/verify.py and README "End-result verifier").
+# Both fire when the agent thinks it is finished. The script spawns a fresh, adversarial
+# verifier that checks the FINAL result against the user's original request — not each
+# subagent's output. The verifier's own `codex exec` run carries VERIFIER_ACTIVE=1, which
+# makes the script no-op for that process, so it cannot recurse.
+#
+# PreToolUse gates `/goal` completion: an unverified goal can never be marked `complete`
+# (the model's honest escape is `blocked`). Stop covers ordinary tasks: a root turn that
+# actually changed something is verified before it is allowed to end.
+# [[hooks.PreToolUse]]
+# matcher = "^update_goal$"
+# [[hooks.PreToolUse.hooks]]
+# type = "command"
+# command = "python3 /home/claudeuser/codex/.codex/hooks/verify.py"
+# timeout = 900
+# statusMessage = "Verifying goal completion against the original request"
+
+# [[hooks.Stop]]
+# [[hooks.Stop.hooks]]
+# type = "command"
+# command = "python3 /home/claudeuser/codex/.codex/hooks/verify.py"
+# timeout = 900
+# statusMessage = "Verifying the end result against the original request"
+
+# MCP servers shared with Claude Code. Both spawn inside the cage: Chromium keeps its
+# profile in /tmp, Ghidra keeps its state in /root/.config/ghidra (see .codex/cage.conf).
+[mcp_servers.browser]
+command = "python"
+args = ["/opt/zendriver-mcp/run.py"]
+env = { DISPLAY = ":99", ZENDRIVER_MCP_GATEWAY = "1" }
+startup_timeout_sec = 60
+tool_timeout_sec = 300
+
+[mcp_servers.ghidra]
+command = "python3"
+args = ["/home/claudeuser/ghidra-in-claude-code/launch_ghidra_mcp.py"]
+env = { GHIDRA_HOME = "/opt/ghidra_12.0.3_PUBLIC", JAVA_HOME = "/opt/jdk-21.0.10+7" }
+startup_timeout_sec = 180
+tool_timeout_sec = 600
+
+[mcp_servers.ghidra.tools.server_status]
+approval_mode = "approve"
+
+[mcp_servers.ghidra.tools.list_instances]
+approval_mode = "approve"
+
+[tui]
+screen_reader_detection_done = true
+# The wrapper owns the title so it can show the DeepSeek USD balance.
+terminal_title = []
+
+[marketplaces.workspace]
+source_type = "local"
+source = "/home/claudeuser/codex/marketplace"
+
+[plugins."codex-security@workspace"]
+enabled = true
+
+[plugins."deepseek-balance@workspace"]
+enabled = true
+
+[plugins."subagent-labels@workspace"]
+enabled = true
+
+# The built-in deep-scan coordinator requires a managed permission profile, which
+# this Landlock-caged workspace cannot expose. Route deep scans to the workspace
+# cxsec-security skill instead.
+[[skills.config]]
+path = "/home/claudeuser/codex/.codex/plugins/cache/workspace/codex-security/0.1.95/skills/deep-security-scan/SKILL.md"
+enabled = false

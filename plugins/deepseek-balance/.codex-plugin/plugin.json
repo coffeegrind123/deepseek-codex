@@ -1,0 +1,26 @@
+{
+  "name": "deepseek-balance",
+  "version": "0.1.0",
+  "description": "Check the available DeepSeek API balance in USD.",
+  "keywords": [
+    "deepseek",
+    "balance",
+    "billing",
+    "api"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "DeepSeek Balance",
+    "shortDescription": "Check the DeepSeek API balance in USD",
+    "longDescription": "Queries the DeepSeek user balance endpoint, selects the USD balance entry, and reports total, granted, and topped-up funds with API availability.",
+    "developerName": "Local Workspace",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Check my DeepSeek API balance."
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+node_modules/
+.codex/secrets.env
+.codex/router.log
+.codex/router.pid
+.codex/sessions/
+.codex/session_index.jsonl
+.codex/tmp/
+.codex/.tmp/
+.codex/*.sqlite*
+.codex/installation_id
+.codex/.sandbox_migration
+.codex/plugins/
+# Codex Security scan state (cs and the plugin), and the plugin copy setup.sh stages
+# from node_modules for the local marketplace.
+.codex/state/
+marketplace/plugins/
+.codex/skills/.system/
+.codex/hooks/state/
+.codex/hooks/__pycache__/
+# Local-only integrations, credentials and state supplied outside this repository.
+.codex/local/
+sandbox-test/
+.codex/shell_snapshots/
+.codex/log/
+.codex/memories/
+.codex/history.jsonl
+.codex/auth.json
+.codex/version.json
+.codex/models_cache.json
+.codex/*.lock
+.codex/thread-writer-locks/
+
+.codex/logs/
+
+# Unrelated work that shares this folder — never part of the workspace repo.
+/.tmp/
+/Elytra/
+/ElytraRE/
+/tools/
+/vulnresearch/
+/android-reverse-engineering/
+/android-reverse-engineering-lab/
+/cases/
+/denon-prime4plus-research/
+/denon-prime4plus-soundcloud-eaas/
+/instantcoffee/
+/jobseeker/
+/refs/
+/reports/
+/rrg/
+/vmaware-2.8.1/
+/PRIME4PLUS-5.0.4-Update.img
+/pi-provider-configuration.md
+/scripts/elytra_byovd_defense.py
+/tests/test_elytra_byovd_defense.py
+# Skill written for the android RE project above, not part of the workspace.
+.codex/skills/android-reverse-engineering/
+
+# Caches and other sessions' state.
+__pycache__/
+/.pnpm-store/
+.codex/cache/
+.codex/worktrees/

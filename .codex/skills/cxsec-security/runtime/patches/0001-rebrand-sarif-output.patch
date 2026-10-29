@@ -1,0 +1,31 @@
+--- a/scripts/finalize_scan_contract.py
++++ b/scripts/finalize_scan_contract.py
+@@ -2574,7 +2574,7 @@
+     if isinstance(candidate_id, str) and candidate_id:
+         properties["candidateId"] = candidate_id
+     partial_fingerprints = {
+-        "codexSecurity/v1": finding["fingerprints"]["primary"],
++        "cxsec/v1": finding["fingerprints"]["primary"],
+     }
+     primary = _sarif_primary_location(finding)
+     line_hash = (line_hash_cache or {}).get((Path(primary["path"]), primary["startLine"]))
+@@ -2606,7 +2606,7 @@
+     run: dict[str, Any] = {
+         "tool": {
+             "driver": {
+-                "name": "Codex Security",
++                "name": "cxsec-security",
+                 "version": scan["producer"]["version"],
+                 "rules": [
+                     _sarif_rule(rule_id, findings_by_rule[rule_id]) for rule_id in ordered_rule_ids
+@@ -2619,8 +2619,8 @@
+             for finding in ordered_findings
+         ],
+         "properties": {
+-            "codexSecuritySchemaVersion": manifest["schemaVersion"],
+-            "codexSecurityTargetKind": target["kind"],
++            "cxsecSchemaVersion": manifest["schemaVersion"],
++            "cxsecTargetKind": target["kind"],
+         },
+     }
+     if target["kind"] == "git_revision" and target.get("remote") and target.get("revision"):

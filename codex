@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Run the folder-local Codex CLI: CODEX_HOME is this folder, cwd is the caller's folder, the
+# model router is started outside the cage, then codex and everything it spawns run under a
+# Landlock policy that can write only here, the work folder and .codex/cage.conf roots. All
+# args pass to codex.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BIN="$ROOT/node_modules/.bin/codex"
+CAGE="$ROOT/sandbox/landlock-exec.py"
+
+# Project-local update path: ./codex update
+if [[ "${1:-}" == "update" ]]; then
+  shift
+  exec "$ROOT/codex-update" "$@"
+fi
+
+[[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
+
+if [[ "${1:-}" == "balance" ]]; then
+  shift
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.codex/secrets.env"
+  set +a
+  exec node "$ROOT/scripts/deepseek-balance.mjs" show "$@"
+fi
+
+"$ROOT/codex-router" ensure >/dev/null
+
+set -a
+# shellcheck disable=SC1091
+. "$ROOT/.codex/secrets.env"
+set +a
+
+# Run an optional integration maintained outside this repository. The hook is an
+# explicit opt-in and failures must not prevent Codex from starting.
+if [[ -n "${CODEX_START_HOOK:-}" && -x "$CODEX_START_HOOK" ]]; then
+  "$CODEX_START_HOOK" ensure >/dev/null 2>&1 || true
+fi
+
+CAGE_RW=()
+CAGE_NET="${CODEX_NET:-open}"
+# shellcheck disable=SC1091
+[[ -f "$ROOT/.codex/cage.conf" ]] && . "$ROOT/.codex/cage.conf"
+
+cage_args=(--rw "$ROOT")
+
+# Work in the caller's folder (or the last -C/--cd DIR) and make it writable in the cage.
+# Run from / or $HOME, it falls back to this folder so the cage never opens up all of home.
+work="$PWD"
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -C|--cd) work="$arg" ;;
+  esac
+  case "$arg" in
+    --cd=*) work="${arg#--cd=}" ;;
+  esac
+  prev="$arg"
+done
+work="$(realpath -e -- "$work")" || { printf 'codex: no such folder: %s\n' "$work" >&2; exit 1; }
+if [[ "$work" == "/" || "$work" == "$(realpath "$HOME")" ]]; then
+  work="$ROOT"
+fi
+[[ "$work" == "$ROOT" || "$work" == "$ROOT"/* ]] || cage_args+=(--rw "$work")
+
+for dir in "${CAGE_RW[@]}"; do
+  [[ -d "$dir" ]] && cage_args+=(--rw "$dir")
+done
+if [[ "$CAGE_NET" == "restricted" ]]; then
+  cage_args+=(--net restricted --tcp-connect "${CODEX_ROUTER_PORT:-8877}")
+else
+  cage_args+=(--net open)
+fi
+
+export CODEX_HOME="$ROOT/.codex"
+export TMPDIR="${TMPDIR:-/tmp}"
+
+# Codex has no custom footer/status-line command. Own the window/tab title
+# instead: most terminals surface that title in their taskbar or tab strip.
+# The daemon runs outside the Landlock cage, writes only terminal escape
+# sequences, and exits when the wrapped Codex PID exits.
+if [[ "${CODEX_DEEPSEEK_BALANCE_TITLE:-auto}" != "off" && -t 1 ]]; then
+  node "$ROOT/scripts/deepseek-balance.mjs" title \
+    --parent-pid "$$" \
+    --tty-fd 1 \
+    --project "$work" \
+    </dev/null >&1 2>/dev/null &
+fi
+
+# End-result verifier hooks (.codex/config.toml -> .codex/hooks/verify.py) are enabled by
+# passing --dangerously-bypass-hook-trust: config hooks otherwise run only after being
+# trusted interactively via /hooks, which non-interactive `./codex exec` can't do. The
+# flag's own help says it is "intended only for automation that already vets hook sources"
+# — that is this case: the hooks are version-controlled in this workspace, authored here,
+# and .codex/AGENTS.md forbids the agent editing config from untrusted content. It applies
+# ONLY to hooks; it changes nothing about the Landlock cage or command approvals.
+# Opt out (e.g. to rely on persisted /hooks trust in a TUI session) with CODEX_HOOK_TRUST=strict.
+hook_args=()
+if [[ "${CODEX_HOOK_TRUST:-bypass}" != "strict" ]]; then
+  hook_args+=(--dangerously-bypass-hook-trust)
+fi
+
+cd "$work"
+exec python3 "$CAGE" "${cage_args[@]}" -- "$BIN" "${hook_args[@]}" "$@"

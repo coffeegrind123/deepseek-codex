@@ -1,0 +1,25 @@
+{
+  "name": "subagent-labels",
+  "version": "0.1.0",
+  "description": "Show human-readable subagent identities and task summaries at startup.",
+  "keywords": [
+    "subagents",
+    "labels",
+    "hooks",
+    "tui"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Subagent Labels",
+    "shortDescription": "Replace bare UUID-only subagent startup activity",
+    "longDescription": "Packages the transcript-aware labeler used by the project SubagentStart hook. The hook reads the child transcript, resolves its generated nickname and role, and emits a concise human-readable task label.",
+    "developerName": "Local Workspace",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Show a human-readable label when each subagent starts."
+    ]
+  }
+}

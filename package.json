@@ -1,0 +1,38 @@
+{
+  "name": "codex-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Folder-restricted OpenAI Codex CLI: DeepSeek Flash orchestrator and subagents",
+  "scripts": {
+    "codex": "./codex",
+    "update:codex": "./codex-update",
+    "router": "node router/router.mjs",
+    "models": "node scripts/build-models.mjs",
+    "test": "node --test router/router.test.mjs",
+    "test:updater": "bash tests/test_codex_update.sh",
+    "test:balance": "node --test plugins/deepseek-balance/test/deepseek-balance.test.mjs plugins/deepseek-balance/test/mcp-server.test.mjs tests/test_deepseek_balance_title.mjs",
+    "test:subagents": "node --test plugins/subagent-labels/test/subagent-start.test.mjs && node scripts/check_subagent_hooks.mjs",
+    "test:security-cost": "node --test tests/test_codex_security_cost_config.mjs && python3 -m pytest -q tests/test_codex_security_cost_config.py tests/test_codex_security_usage.py tests/test_patch_codex_security_plugin.py",
+    "test:all": "npm test && npm run test:updater && npm run test:balance && npm run test:subagents && npm run test:security-cost"
+  },
+  "dependencies": {
+    "@openai/codex": "0.163.0",
+    "@openai/codex-security": "0.6.0"
+  },
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coffeegrind123/deepseek-codex.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/coffeegrind123/deepseek-codex/issues"
+  },
+  "homepage": "https://github.com/coffeegrind123/deepseek-codex#readme"
+}

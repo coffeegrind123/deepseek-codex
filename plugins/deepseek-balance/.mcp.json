@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "deepseek-balance": {
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "DEEPSEEK_API_KEY"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 30
+    }
+  }
+}
