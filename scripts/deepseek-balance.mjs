@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 
-import { basename } from "node:path";
-import { readFileSync, writeSync } from "node:fs";
+import { basename, dirname } from "node:path";
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 
 import {
   DeepSeekBalanceError,
@@ -13,6 +19,8 @@ import {
 const DEFAULT_INTERVAL_MS = 60_000;
 const MIN_INTERVAL_MS = 15_000;
 const DEFAULT_TITLE = "Codex";
+const DEFAULT_CACHE_MAX_AGE_MS = 5 * 60_000;
+const CACHE_VERSION = 1;
 
 function parseArgs(argv) {
   const [command = "show", ...rest] = argv;
@@ -20,12 +28,18 @@ function parseArgs(argv) {
     command,
     json: false,
     once: false,
+    noTitle: false,
     parentPid: null,
     ttyFd: 1,
     project: "",
+    cacheFile: process.env.DEEPSEEK_BALANCE_CACHE_FILE,
     endpoint: process.env.DEEPSEEK_BALANCE_URL,
     intervalMs: Number(
       process.env.CODEX_DEEPSEEK_BALANCE_INTERVAL_MS ?? DEFAULT_INTERVAL_MS,
+    ),
+    cacheMaxAgeMs: Number(
+      process.env.DEEPSEEK_BALANCE_CACHE_MAX_AGE_MS ??
+        DEFAULT_CACHE_MAX_AGE_MS,
     ),
   };
 
@@ -38,6 +52,9 @@ function parseArgs(argv) {
       case "--once":
         options.once = true;
         break;
+      case "--no-title":
+        options.noTitle = true;
+        break;
       case "--parent-pid":
         options.parentPid = Number(rest[++index]);
         break;
@@ -49,6 +66,9 @@ function parseArgs(argv) {
         break;
       case "--endpoint":
         options.endpoint = rest[++index];
+        break;
+      case "--cache-file":
+        options.cacheFile = rest[++index];
         break;
       case "--interval-ms":
         options.intervalMs = Number(rest[++index]);
@@ -69,11 +89,12 @@ function usage() {
   return [
     "Usage:",
     "  node scripts/deepseek-balance.mjs show [--json]",
-    "  node scripts/deepseek-balance.mjs title --parent-pid PID [options]",
+    "  node scripts/deepseek-balance.mjs status [--cache-file PATH] [--endpoint URL]",
+    "  node scripts/deepseek-balance.mjs title --parent-pid PID [--no-title] [--cache-file PATH] [options]",
     "",
-    "The title command owns the terminal window/tab title while the wrapped",
-    "Codex process is alive. It refreshes the DeepSeek USD balance at a bounded",
-    "interval and never prints the API key.",
+    "The status command emits one footer-safe line. The title command owns the",
+    "terminal window/tab title while the wrapped Codex process is alive. Both",
+    "never print the API key.",
   ].join("\n");
 }
 
@@ -86,6 +107,74 @@ async function show(options) {
   }
 
   process.stdout.write(`${formatDeepSeekBalance(balance)}\n`);
+}
+
+async function status(options) {
+  if (options.cacheFile) {
+    const cached = readBalanceCache(options.cacheFile, options.cacheMaxAgeMs);
+    const line = formatDeepSeekBalanceTitle(cached.balance);
+    process.stdout.write(`${line}${cached.stale ? " (stale)" : ""}\n`);
+    return;
+  }
+
+  const balance = await queryDeepSeekBalance({ endpoint: options.endpoint });
+  process.stdout.write(`${formatDeepSeekBalanceTitle(balance)}\n`);
+}
+
+function readBalanceCache(cacheFile, maxAgeMs = DEFAULT_CACHE_MAX_AGE_MS) {
+  let payload;
+  try {
+    payload = JSON.parse(readFileSync(cacheFile, "utf8"));
+  } catch {
+    throw new Error("DeepSeek balance cache is missing or invalid.");
+  }
+
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    payload.version !== CACHE_VERSION ||
+    payload.stale !== false && payload.stale !== true
+  ) {
+    throw new Error("DeepSeek balance cache is missing or invalid.");
+  }
+
+  try {
+    formatDeepSeekBalanceTitle(payload.balance);
+  } catch {
+    throw new Error("DeepSeek balance cache is missing or invalid.");
+  }
+
+  const fetchedAt = Date.parse(payload.fetched_at);
+  const ageMs = Date.now() - fetchedAt;
+  const tooOld =
+    !Number.isFinite(maxAgeMs) ||
+    maxAgeMs <= 0 ||
+    !Number.isFinite(ageMs) ||
+    ageMs < -maxAgeMs ||
+    ageMs > maxAgeMs;
+
+  return {
+    balance: payload.balance,
+    stale: payload.stale || tooOld,
+  };
+}
+
+function writeBalanceCache(cacheFile, balance, stale) {
+  const directory = dirname(cacheFile);
+  mkdirSync(directory, { recursive: true });
+
+  const tempFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`;
+  const payload = {
+    version: CACHE_VERSION,
+    fetched_at: new Date().toISOString(),
+    stale,
+    balance,
+  };
+  writeFileSync(tempFile, `${JSON.stringify(payload)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  renameSync(tempFile, cacheFile);
 }
 
 function titleText(balance, project) {
@@ -151,16 +240,36 @@ async function titleDaemon(options) {
     ? Math.max(MIN_INTERVAL_MS, options.intervalMs)
     : DEFAULT_INTERVAL_MS;
   let lastBalance = null;
+  if (options.cacheFile) {
+    try {
+      lastBalance = readBalanceCache(
+        options.cacheFile,
+        options.cacheMaxAgeMs,
+      ).balance;
+    } catch {
+      // A missing cache is expected on the first run.
+    }
+  }
 
   while (parentAlive(options.parentPid)) {
     try {
       lastBalance = await queryDeepSeekBalance({ endpoint: options.endpoint });
-      writeTitleToFd(options.ttyFd, titleText(lastBalance, options.project));
+      if (options.cacheFile) {
+        writeBalanceCache(options.cacheFile, lastBalance, /*stale*/ false);
+      }
+      if (!options.noTitle) {
+        writeTitleToFd(options.ttyFd, titleText(lastBalance, options.project));
+      }
     } catch (error) {
+      if (options.cacheFile && lastBalance) {
+        writeBalanceCache(options.cacheFile, lastBalance, /*stale*/ true);
+      }
       const title = lastBalance
         ? `${titleText(lastBalance, options.project)} (stale)`
         : `DeepSeek balance unavailable${options.project ? ` | ${basename(options.project)}` : ""}`;
-      writeTitleToFd(options.ttyFd, title);
+      if (!options.noTitle) {
+        writeTitleToFd(options.ttyFd, title);
+      }
     }
 
     if (options.once) {
@@ -172,10 +281,12 @@ async function titleDaemon(options) {
     }
   }
 
-  writeTitleToFd(
-    options.ttyFd,
-    options.project ? `Codex | ${basename(options.project)}` : DEFAULT_TITLE,
-  );
+  if (!options.noTitle) {
+    writeTitleToFd(
+      options.ttyFd,
+      options.project ? `Codex | ${basename(options.project)}` : DEFAULT_TITLE,
+    );
+  }
 }
 
 async function main() {
@@ -186,6 +297,10 @@ async function main() {
   }
   if (options.command === "show") {
     await show(options);
+    return;
+  }
+  if (options.command === "status") {
+    await status(options);
     return;
   }
   if (options.command === "title") {

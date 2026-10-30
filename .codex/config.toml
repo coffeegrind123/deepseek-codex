@@ -187,8 +187,14 @@ approval_mode = "approve"
 
 [tui]
 screen_reader_detection_done = true
-# The wrapper owns the title so it can show the DeepSeek USD balance.
+status_line = ["model-with-reasoning", "current-dir", "deepseek-balance"]
 terminal_title = []
+
+[tui.status_line_commands.deepseek-balance]
+command = ["deepseek-balance.mjs", "status"]
+refresh_interval_ms = 60000
+timeout_ms = 10000
+fallback = "DeepSeek unavailable"
 
 [marketplaces.workspace]
 source_type = "local"

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CODEX = path.join(ROOT, "node_modules/.bin/codex");
+const CODEX = execFileSync(path.join(ROOT, "scripts/resolve-codex-bin.sh"), [], {
+  encoding: "utf8",
+}).trim();
 const REQUIRED_EVENTS = new Set(["preToolUse", "subagentStart"]);
 const TIMEOUT_MS = 15_000;
 
@@ -20,6 +22,8 @@ const child = spawn(CODEX, ["app-server", "--stdio"], {
   env: {
     ...process.env,
     CODEX_HOME: path.join(ROOT, ".codex"),
+    CODEX_MANAGED_PACKAGE_ROOT: path.join(ROOT, "node_modules/@openai/codex"),
+    CODEX_MANAGED_BY_NPM: "1",
   },
   stdio: ["pipe", "pipe", "pipe"],
 });

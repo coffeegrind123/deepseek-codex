@@ -2,8 +2,8 @@
 
 ```
 git clone git@github.com:coffeegrind123/deepseek-codex.git codex && cd codex
-./setup.sh                   npm ci, keys -> .codex/secrets.env, catalog, skills, router, key probes,
-                             ~/.local/bin/codex symlink
+./setup.sh                   npm ci, patched Codex build, keys -> .codex/secrets.env,
+                             catalog, skills, router, key probes, ~/.local/bin/codex symlink
 ./setup.sh --check           verify an existing clone
 
 ./codex                      interactive TUI (cwd = caller's folder, CODEX_HOME = ./.codex)
@@ -28,17 +28,41 @@ npm run models               regenerate .codex/models.json from .codex/catalog/
 ```sh
 ./codex update                   # update the workspace-local CLI to the latest npm release
 ./codex update --check           # show pinned, installed, and latest versions
-./codex update 0.163.0           # install an exact version
+./codex update 0.166.0           # install an exact version
 ```
 
 The npm cache is redirected to `/tmp/codex-npm-cache` so the update works inside this
 container's Landlock policy. The updater installs the candidate into a staging directory
-and verifies its pinned version and executable before touching the live tree. Only then
-does it ask to stop active workspace Codex sessions, promote the staged install with
-filesystem renames, and roll back both `node_modules` and the manifest files if
-post-promotion checks fail. A failed download, install, or staged verification leaves
+and builds the matching patched Codex runtime before touching the live tree. Only then
+does it ask to stop active workspace Codex sessions, promote both the npm baseline and
+`tools/codex-local/current` as one rollback transaction, and restore both if
+post-promotion checks fail. A failed download, build, or staged verification leaves
 running sessions and the live installation untouched. `./codex-update` is the equivalent
 standalone entry point.
+
+The executable is kept outside `node_modules`, because npm replaces that whole tree on
+updates. Resolver precedence is `CODEX_WORKSPACE_BIN`, then
+`tools/codex-local/current/codex`, then the npm launcher. An explicitly selected or
+already-enabled local build fails closed if it is missing, broken, or version-mismatched;
+Codex never silently falls back to an unpatched build.
+
+```sh
+npm run build:codex-local -- 0.166.0  # build and publish a matching patched runtime
+scripts/resolve-codex-bin.sh          # print the active absolute executable
+```
+
+Patch filenames select their target: `codex-<version>-<name>.patch` applies only to that
+`rust-v<version>` tag, while `codex-common-<name>.patch` applies to every target. The
+updater also compares the recorded patch-series hash, so editing a patch rebuilds the
+same Codex version instead of reusing a stale runtime.
+
+This build is intentional. Stock Codex accepts only fixed identifiers in
+[`tui.status_line`](https://developers.openai.com/codex/config-reference/), and the
+official Linux payload is a stripped static-PIE executable. A byte-diff from the stock
+binary must therefore be regenerated for every exact release from a corresponding patched
+build; hand-maintained code-cave patches would need a new reverse-engineering pass per
+release and are more brittle than the source patch. The updater rebuilds locally so a
+future upstream release fails closed rather than applying a stale binary recipe.
 
 ### DeepSeek balance
 
@@ -51,11 +75,18 @@ The local `deepseek-balance` plugin also exposes `get_deepseek_balance` to agent
 DeepSeek's official `GET https://api.deepseek.com/user/balance` endpoint, selects the USD
 entry explicitly, and never returns the API key.
 
-Codex plugins cannot add custom footer/status-line items. The wrapper therefore owns the
-terminal window/tab title while Codex runs, writing `DeepSeek $12.34 USD | project` every
-60 seconds. That title is the label shown by terminal tabs and taskbars. Set
-`CODEX_DEEPSEEK_BALANCE_TITLE=off` to disable it. `tui.terminal_title` is set to an empty
-item list so Codex does not overwrite the balance.
+The patched Codex TUI adds a generic command-backed status-line item. `config.toml`
+selects `deepseek-balance` and renders `DeepSeek $12.34 USD` in the bottom status bar.
+The wrapped TUI cannot reach DeepSeek directly under `CODEX_NET=restricted`, so the
+out-of-cage wrapper daemon refreshes `.codex/cache/deepseek-balance.json`; the footer
+command reads that atomic cache once per minute through a helper added to `PATH` by the
+wrapper. Output is limited to 4 KiB and one 240-character display line before it reaches
+the renderer; controls, bidi markers, ANSI/OSC sequences, and the command's process group
+are handled, and failures replace the value with `DeepSeek unavailable` while a previous
+successful value is marked stale. Cache entries older than five minutes are also stale.
+The wrapper retains the terminal-title balance indicator by default; set
+`CODEX_DEEPSEEK_BALANCE_TITLE=off` to disable only the title while keeping the footer cache
+fresh.
 
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with `CODEX_HOME` here and cwd in the folder you ran it from (or `-C DIR`),
@@ -334,7 +365,7 @@ Both hooks are explicit opt-ins and remain outside this repository.
 ./codex ──► codex-router ensure ──► router/router.mjs :8877 (outside the cage)
    │                                     ├─ deepseek-* ──► https://api.deepseek.com     (DEEPSEEK_API_KEY)
    │                                     └─ glm-*      ──► https://api.z.ai/api/v1      (ZAI_API_KEY, /model only)
-   └─► sandbox/landlock-exec.py --rw . --rw /tmp ... ──► node_modules/.bin/codex
+   └─► sandbox/landlock-exec.py --rw . --rw /tmp ... ──► tools/codex-local/current/codex
             (kernel policy inherited by subagents, MCP servers, every shell command)
 ```
 
@@ -365,7 +396,10 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/agents/*.toml` | role layers: `default`, `explorer`, `worker`, `verifier` → `deepseek-flash`; multi-agent pinned to v1 + `max_depth = 2` (orchestrator → agent → agent); at most 15 open at once |
 | `plugins/deepseek-balance/` | local plugin: USD balance MCP tool, skill, and reusable balance client |
 | `plugins/subagent-labels/` | local labeler bundled as a plugin; `.codex/hooks.json` wires it to `PreToolUse` and `SubagentStart` so subagents get human-readable task labels even when the TUI metadata race would otherwise show only a UUID |
-| `scripts/deepseek-balance.mjs` | `./codex balance` CLI and terminal-title daemon used by the wrapper |
+| `scripts/deepseek-balance.mjs` | `./codex balance`, footer status, and terminal-title daemon |
+| `scripts/build-codex-local.sh` | builds and atomically publishes a patched Codex runtime for one upstream version |
+| `scripts/resolve-codex-bin.sh` | selects the external local build, explicit override, or npm fallback with fail-closed validation |
+| `patches/codex/` | status-line command extension applied to the matching Codex source tag |
 | `.codex/hooks/` | end-result verifier: `verify.py` (Stop + `update_goal` hook), `verifier_prompt.md`, `verify_test.py`; `state/` (round counters) git-ignored |
 | `.codex/catalog/` | model metadata sources; `deepseek-flash.json` (DeepSeek's official entry, default), `glm-5.3.json` (opt-in via `/model`), `base_instructions.md` (Codex `models-manager/prompt.md`, unchanged through rust-v0.158.0) |
 | `.codex/models.json` | generated catalog (`npm run models`) |
@@ -379,7 +413,8 @@ Machine-specific paths that `setup.sh` does not manage: the `ghidra` MCP launche
 (`~/ghidra-in-claude-code/launch_ghidra_mcp.py`, `GHIDRA_HOME`, `JAVA_HOME`) and the
 `browser` launcher (`/opt/zendriver-mcp/run.py`) in `config.toml`, and the skill symlinks'
 source (`CLAUDE_SKILLS_DIR`, default `~/.claude/skills`). Requires Linux with Landlock
-(kernel ≥ 5.13; ≥ 6.7 for `CODEX_NET=restricted`) and Node ≥ 20.
+(kernel ≥ 5.13; ≥ 6.7 for `CODEX_NET=restricted`), Node ≥ 20, and a Rust toolchain with
+`cargo`, `rustc`, `git`, `sha256sum`, and `flock` for the patched runtime build.
 
 Not committed (see `.gitignore`): `.codex/secrets.env`, sessions, sqlite state, router
 log/pid, `node_modules`, local integrations, and `.codex/hooks/state/`.
@@ -407,3 +442,5 @@ bridge) are the same servers Claude Code uses, declared in `config.toml`. Tool n
   with plugins on vs 52s/37s off), though on an older Codex it blocked each start ~47s.
 - Upgrade Codex: `./codex update [<ver>]`; refresh `.codex/catalog/base_instructions.md`
   from `codex-rs/models-manager/prompt.md` at the matching `rust-v<ver>` tag.
+  The updater must also build the matching patch series; npm baseline updates do not
+  replace or bypass the external local runtime.

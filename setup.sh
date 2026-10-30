@@ -36,7 +36,35 @@ if (( ! CHECK_ONLY )); then
   (cd "$ROOT" && NPM_CONFIG_CACHE="$ROOT/.tmp/npm-cache" npm ci --no-fund --no-audit >/dev/null)
 fi
 [[ -x "$ROOT/node_modules/.bin/codex" ]] || die "node_modules/.bin/codex missing; run without --check"
-ok "codex $("$ROOT/node_modules/.bin/codex" --version)"
+PINNED_CODEX="$(node -e 'process.stdout.write(require(process.argv[1]).dependencies["@openai/codex"])' "$ROOT/package.json" 2>/dev/null || true)"
+[[ -n "$PINNED_CODEX" ]] || die "package.json does not pin @openai/codex"
+if (( ! CHECK_ONLY )); then
+  "$ROOT/scripts/build-codex-local.sh" "$PINNED_CODEX" || die "failed to build patched Codex $PINNED_CODEX"
+fi
+LOCAL_CODEX="$ROOT/tools/codex-local/current/codex"
+[[ -x "$LOCAL_CODEX" ]] || die "patched Codex runtime is missing; run without --check"
+LOCAL_CODEX_VERSION="$("$LOCAL_CODEX" --version)" \
+  || die "patched Codex runtime could not report its version"
+[[ "$LOCAL_CODEX_VERSION" == "codex-cli $PINNED_CODEX" ]] \
+  || die "patched Codex runtime reports '$LOCAL_CODEX_VERSION', expected 'codex-cli $PINNED_CODEX'"
+EXPECTED_PATCH_SHA="$("$ROOT/scripts/build-codex-local.sh" --print-patch-sha "$PINNED_CODEX")" \
+  || die "could not hash the patch series for Codex $PINNED_CODEX"
+LOCAL_PATCH_SHA="$(node -e '
+  try {
+    const build = require(process.argv[1]);
+    process.stdout.write(build.patch_sha ?? build.patchSha ?? "");
+  } catch {}
+' "$ROOT/tools/codex-local/current/build.json")"
+[[ "$LOCAL_PATCH_SHA" == "$EXPECTED_PATCH_SHA" ]] \
+  || die "patched Codex runtime uses patch $LOCAL_PATCH_SHA, expected $EXPECTED_PATCH_SHA; run without --check"
+CODEX_BIN="$("$ROOT/scripts/resolve-codex-bin.sh")" \
+  || die "could not resolve the active Codex executable"
+[[ -x "$CODEX_BIN" ]] || die "active Codex executable is missing: $CODEX_BIN"
+CODEX_VERSION="$("$CODEX_BIN" --version)" \
+  || die "active Codex executable could not report its version"
+[[ "$CODEX_VERSION" == "codex-cli $PINNED_CODEX" ]] \
+  || die "active Codex executable reports '$CODEX_VERSION', expected 'codex-cli $PINNED_CODEX'"
+ok "$CODEX_VERSION ($CODEX_BIN)"
 
 printf '== secrets\n'
 if [[ ! -f "$SECRETS" ]]; then
@@ -154,12 +182,12 @@ else
   fi
   sed -i -E "/^\[marketplaces\.workspace\]/,/^source =/ s|^source = .*|source = \"$ROOT/marketplace\"|" "$CONFIG"
   if ! grep -q '^\[marketplaces\.workspace\]' "$CONFIG"; then
-    CODEX_HOME="$ROOT/.codex" "$ROOT/node_modules/.bin/codex" plugin marketplace add "$ROOT/marketplace" >/dev/null
+    CODEX_HOME="$ROOT/.codex" "$CODEX_BIN" plugin marketplace add "$ROOT/marketplace" >/dev/null
   fi
   if ! python3 "$CS_PATCH" --source "$CS_PKG" --output "$CS_CACHE/$CS_VERSION" --check --quiet \
     --allow-extra 'mcp/daybreak-original.server.mjs.br.part-*' \
     --allow-modified 'mcp/server.mjs.br.part-*' 2>/dev/null; then
-    CODEX_HOME="$ROOT/.codex" "$ROOT/node_modules/.bin/codex" plugin add codex-security@workspace >/dev/null
+    CODEX_HOME="$ROOT/.codex" "$CODEX_BIN" plugin add codex-security@workspace >/dev/null
   fi
 fi
 [[ -f "$CS_CACHE/$CS_VERSION/.codex-plugin/plugin.json" ]] \
@@ -188,7 +216,7 @@ else
   rm -rf -- "$DB_STAGE"
   mkdir -p "$DB_STAGE"
   cp -a "$DB_SRC/." "$DB_STAGE/"
-  CODEX_HOME="$ROOT/.codex" "$ROOT/node_modules/.bin/codex" plugin add deepseek-balance@workspace >/dev/null
+  CODEX_HOME="$ROOT/.codex" "$CODEX_BIN" plugin add deepseek-balance@workspace >/dev/null
   node --test "$ROOT/plugins/deepseek-balance/test/deepseek-balance.test.mjs" \
     "$ROOT/plugins/deepseek-balance/test/mcp-server.test.mjs" \
     "$ROOT/tests/test_deepseek_balance_title.mjs" >/dev/null
@@ -213,7 +241,7 @@ else
   rm -rf -- "$SL_STAGE"
   mkdir -p "$SL_STAGE"
   cp -a "$SL_SRC/." "$SL_STAGE/"
-  CODEX_HOME="$ROOT/.codex" "$ROOT/node_modules/.bin/codex" plugin add subagent-labels@workspace >/dev/null
+  CODEX_HOME="$ROOT/.codex" "$CODEX_BIN" plugin add subagent-labels@workspace >/dev/null
   node --test "$ROOT/plugins/subagent-labels/test/subagent-start.test.mjs" >/dev/null
 fi
 SL_CACHE="$ROOT/.codex/plugins/cache/workspace/subagent-labels/$SL_VERSION/.codex-plugin/plugin.json"

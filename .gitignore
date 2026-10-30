@@ -60,4 +60,5 @@ sandbox-test/
 __pycache__/
 /.pnpm-store/
 .codex/cache/
+.codex/app-server-daemon/
 .codex/worktrees/

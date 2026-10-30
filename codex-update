@@ -7,6 +7,10 @@ NPM_CACHE="${CODEX_NPM_CACHE:-/tmp/codex-npm-cache}"
 BUILD_VERSION="${CODEX_UPDATE_VERSION:-latest}"
 CHECK_ONLY=0
 
+RESOLVER="$ROOT/scripts/resolve-codex-bin.sh"
+LOCAL_BUILDER="$ROOT/scripts/build-codex-local.sh"
+LOCAL_CURRENT="$ROOT/tools/codex-local/current"
+
 STAGE_DIR=""
 ROLLBACK_DIR=""
 PROMOTION_STARTED=0
@@ -14,9 +18,14 @@ PROMOTION_FINISHED=0
 BACKED_UP_NODE_MODULES=0
 BACKED_UP_PACKAGE_JSON=0
 BACKED_UP_PACKAGE_LOCK=0
+BACKED_UP_LOCAL_CURRENT=0
 PROMOTED_NODE_MODULES=0
 PROMOTED_PACKAGE_JSON=0
 PROMOTED_PACKAGE_LOCK=0
+PROMOTED_LOCAL_CURRENT=0
+PENDING_LOCAL_CURRENT=""
+ACTIVE_CODEX_BIN=""
+ACTIVE_RESOLUTION_FAILED=0
 
 cleanup() {
   local status="$?"
@@ -28,6 +37,10 @@ cleanup() {
     fi
   fi
 
+  if [[ -n "$PENDING_LOCAL_CURRENT" ]] \
+    && [[ -e "$PENDING_LOCAL_CURRENT" || -L "$PENDING_LOCAL_CURRENT" ]]; then
+    remove_path "$PENDING_LOCAL_CURRENT"
+  fi
   if [[ -n "$STAGE_DIR" && -e "$STAGE_DIR" ]]; then
     rm -rf -- "$STAGE_DIR"
   fi
@@ -37,6 +50,7 @@ cleanup() {
 
   exit "$status"
 }
+trap 'exit 130' INT TERM HUP
 trap cleanup EXIT
 
 usage() {
@@ -45,15 +59,17 @@ Usage: ./codex-update [--check] [VERSION]
        ./codex update [--check] [VERSION]
 
 Update the workspace-local Codex CLI to the latest npm release, or to an
-explicit version such as 0.163.0.
+explicit version such as 0.166.0.
 
 Options:
-  --check       Show installed, pinned, and latest versions without changing files
+  --check       Show npm and local runtime status without changing files
   -h, --help    Show this help
 
-The candidate is installed and verified in a workspace staging directory. If
-workspace Codex processes are active, the update asks whether to stop them only
-after that verification and immediately before promotion.
+The npm candidate and patched local runtime are built and verified before live
+promotion. The local current pointer and npm dependencies are promoted as one
+transaction and rolled back together on failure. If Codex processes using the
+active runtime are running, the update asks whether to stop them only after
+candidate verification and immediately before promotion.
 EOF
 }
 
@@ -74,10 +90,14 @@ rollback_promotion() {
   local restore_node_modules=1
   local restore_package_json=1
   local restore_package_lock=1
+  local restore_local_current=1
 
   [[ "$PROMOTION_STARTED" -eq 1 ]] || return 0
   [[ -n "$ROLLBACK_DIR" ]] || return 1
 
+  if [[ "$PROMOTED_LOCAL_CURRENT" -eq 1 ]]; then
+    remove_path "$LOCAL_CURRENT" || { restore_local_current=0; ok=0; }
+  fi
   if [[ "$PROMOTED_NODE_MODULES" -eq 1 ]]; then
     remove_path "$ROOT/node_modules" || { restore_node_modules=0; ok=0; }
   fi
@@ -97,6 +117,9 @@ rollback_promotion() {
   if [[ "$BACKED_UP_PACKAGE_LOCK" -eq 1 && "$restore_package_lock" -eq 1 ]]; then
     mv -- "$ROLLBACK_DIR/package-lock.json" "$ROOT/package-lock.json" || ok=0
   fi
+  if [[ "$BACKED_UP_LOCAL_CURRENT" -eq 1 && "$restore_local_current" -eq 1 ]]; then
+    mv -- "$ROLLBACK_DIR/current" "$LOCAL_CURRENT" || ok=0
+  fi
 
   [[ "$ok" -eq 1 ]] || return 1
 
@@ -104,9 +127,11 @@ rollback_promotion() {
   PROMOTED_NODE_MODULES=0
   PROMOTED_PACKAGE_JSON=0
   PROMOTED_PACKAGE_LOCK=0
+  PROMOTED_LOCAL_CURRENT=0
   BACKED_UP_NODE_MODULES=0
   BACKED_UP_PACKAGE_JSON=0
   BACKED_UP_PACKAGE_LOCK=0
+  BACKED_UP_LOCAL_CURRENT=0
   rm -rf -- "$ROLLBACK_DIR"
   ROLLBACK_DIR=""
 }
@@ -173,8 +198,115 @@ lock_version() {
   ' "$1"
 }
 
+build_target() {
+  node -e '
+    try {
+      const build = require(process.argv[1]);
+      process.stdout.write(
+        build.target ??
+        build.targetVersion ??
+        build.packageVersion ??
+        build.codexVersion ??
+        build.codex?.target ??
+        build.codex?.version ??
+        build.version ??
+        "",
+      );
+    } catch {}
+  ' "$1"
+}
+
+build_executable_sha() {
+  node -e '
+    try {
+      process.stdout.write(require(process.argv[1]).executable_sha ?? "");
+    } catch {}
+  ' "$1"
+}
+
+build_patch_sha() {
+  node -e '
+    try {
+      const build = require(process.argv[1]);
+      process.stdout.write(build.patch_sha ?? build.patchSha ?? "");
+    } catch {}
+  ' "$1"
+}
+
+patch_sha_for() {
+  local target="$1"
+
+  [[ -x "$LOCAL_BUILDER" ]] || {
+    printf 'codex-update: local runtime builder is missing or not executable: %s\n' \
+      "$LOCAL_BUILDER" >&2
+    return 1
+  }
+  "$LOCAL_BUILDER" --print-patch-sha "$target"
+}
+
 latest_version() {
   npm view "$PACKAGE_NAME" version --silent
+}
+
+resolve_codex_bin() {
+  local resolved
+
+  [[ -x "$RESOLVER" ]] || {
+    printf 'codex-update: executable resolver is missing: %s\n' "$RESOLVER" >&2
+    return 1
+  }
+  resolved="$(CODEX_BIN_EXPECTED_VERSION="$TARGET" "$RESOLVER")" || {
+    printf 'codex-update: could not resolve the active Codex executable\n' >&2
+    return 1
+  }
+  [[ "$resolved" == /* ]] || {
+    printf "codex-update: resolver returned a non-absolute path: '%s'\n" "$resolved" >&2
+    return 1
+  }
+  printf '%s\n' "$resolved"
+}
+
+local_runtime_exists() {
+  [[ -e "$LOCAL_CURRENT" || -L "$LOCAL_CURRENT" ]]
+}
+
+local_runtime_matches() {
+  local target="$1" actual build expected_hash actual_hash expected_patch_sha actual_patch_sha
+
+  local_runtime_exists || return 1
+  [[ -x "$LOCAL_CURRENT/codex" ]] || return 1
+  [[ -f "$LOCAL_CURRENT/build.json" ]] || return 1
+
+  build="$(build_target "$LOCAL_CURRENT/build.json")"
+  [[ "$build" == "$target" ]] || return 1
+
+  expected_patch_sha="$(patch_sha_for "$target")" || return 1
+  actual_patch_sha="$(build_patch_sha "$LOCAL_CURRENT/build.json")"
+  [[ "$actual_patch_sha" == "$expected_patch_sha" ]] || return 1
+
+  actual="$("$LOCAL_CURRENT/codex" --version 2>/dev/null)" || return 1
+  [[ "$actual" == "codex-cli $target" ]] || return 1
+
+  expected_hash="$(build_executable_sha "$LOCAL_CURRENT/build.json")"
+  if [[ -n "$expected_hash" ]]; then
+    actual_hash="$(sha256sum -- "$LOCAL_CURRENT/codex" | awk '{print $1}')" || return 1
+    [[ "$actual_hash" == "$expected_hash" ]] || return 1
+  fi
+}
+
+npm_runtime_matches() {
+  local target="$1"
+  local actual lock
+
+  [[ "$(manifest_version "$ROOT/package.json")" == "$target" ]] || return 1
+  [[ "$(installed_version "$ROOT/node_modules/@openai/codex/package.json")" == "$target" ]] || return 1
+  if [[ -f "$ROOT/package-lock.json" ]]; then
+    lock="$(lock_version "$ROOT/package-lock.json")"
+    [[ "$lock" == "$target" ]] || return 1
+  fi
+  [[ -x "$ROOT/node_modules/.bin/codex" ]] || return 1
+  actual="$("$ROOT/node_modules/.bin/codex" --version 2>/dev/null)" || return 1
+  [[ "$actual" == "codex-cli $target" ]]
 }
 
 active_workspace_codex() {
@@ -191,20 +323,33 @@ process_is_zombie() {
 }
 
 workspace_codex_processes() {
-  local arg argv0 cmdline exe pid target seen=" "
+  local active_real arg arg_real argv0 cmdline exe pid target seen=" "
   local -a argv=()
+
+  active_real=""
+  if [[ -n "$ACTIVE_CODEX_BIN" ]]; then
+    active_real="$(readlink -f "$ACTIVE_CODEX_BIN" 2>/dev/null || true)"
+  fi
 
   for exe in /proc/[0-9]*/exe; do
     target="$(readlink "$exe" 2>/dev/null || true)"
     case "$target" in
-      "$ROOT/node_modules/@openai/"*)
+      "$ROOT/node_modules/@openai/"*|"$ROOT/tools/codex-local/"*)
         pid="${exe#/proc/}"
         pid="${pid%/exe}"
         process_is_zombie "$pid" && continue
         printf '%s\t%s\n' "$pid" "$target"
         seen+="$pid "
+        continue
         ;;
     esac
+    if [[ -n "$active_real" && "$target" == "$active_real" ]]; then
+      pid="${exe#/proc/}"
+      pid="${pid%/exe}"
+      process_is_zombie "$pid" && continue
+      printf '%s\t%s\n' "$pid" "$target"
+      seen+="$pid "
+    fi
   done
 
   for cmdline in /proc/[0-9]*/cmdline; do
@@ -216,7 +361,7 @@ workspace_codex_processes() {
     argv0="${argv[0]:-}"
 
     case "$argv0" in
-      "$ROOT/node_modules/@openai/"*)
+      "$ROOT/node_modules/@openai/"*|"$ROOT/tools/codex-local/"*|"$ROOT/codex")
         process_is_zombie "$pid" && continue
         printf '%s\t%s\n' "$pid" "${argv[*]}"
         seen+="$pid "
@@ -224,11 +369,29 @@ workspace_codex_processes() {
         ;;
     esac
 
+    if [[ -n "$ACTIVE_CODEX_BIN" ]]; then
+      for arg in "${argv[@]}"; do
+        if [[ "$arg" != "$ACTIVE_CODEX_BIN" ]]; then
+          case "$arg" in
+            */*codex*) ;;
+            *) continue ;;
+          esac
+          arg_real="$(readlink -f "$arg" 2>/dev/null || true)"
+          [[ -n "$active_real" && "$arg_real" == "$active_real" ]] || continue
+        fi
+        process_is_zombie "$pid" && break
+        printf '%s\t%s\n' "$pid" "${argv[*]}"
+        seen+="$pid "
+        break
+      done
+      [[ "$seen" == *" $pid "* ]] && continue
+    fi
+
     case "${argv0##*/}" in
       node|nodejs)
         for arg in "${argv[@]:1}"; do
           case "$arg" in
-            "$ROOT/node_modules/.bin/codex"|"$ROOT/node_modules/@openai/"*)
+            "$ROOT/node_modules/.bin/codex"|"$ROOT/node_modules/@openai/"*|"$ROOT/tools/codex-local/"*)
               process_is_zombie "$pid" && break
               printf '%s\t%s\n' "$pid" "${argv[*]}"
               seen+="$pid "
@@ -288,20 +451,193 @@ confirm_kill_active_codex() {
   esac
 }
 
-verify_live_installation() {
+verify_npm_tree() {
   local target="$1"
-  local cli_version installed manifest wrapper_version
+  local base="$2"
+  local label="$3"
+  local cli_version installed lock manifest
 
-  manifest="$(manifest_version "$ROOT/package.json")"
-  installed="$(installed_version "$ROOT/node_modules/@openai/codex/package.json")"
+  manifest="$(manifest_version "$base/package.json")"
+  installed="$(installed_version "$base/node_modules/@openai/codex/package.json")"
   if [[ "$manifest" != "$target" ]]; then
-    printf 'codex-update: package.json pins %s, expected %s\n' "${manifest:-missing}" "$target" >&2
+    printf 'codex-update: %s package.json pins %s, expected %s\n' \
+      "$label" "${manifest:-missing}" "$target" >&2
     return 1
   fi
   if [[ "$installed" != "$target" ]]; then
-    printf 'codex-update: node_modules contains %s, expected %s\n' "${installed:-missing}" "$target" >&2
+    printf 'codex-update: %s node_modules contains %s, expected %s\n' \
+      "$label" "${installed:-missing}" "$target" >&2
     return 1
   fi
+
+  if [[ -f "$base/package-lock.json" ]]; then
+    lock="$(lock_version "$base/package-lock.json")"
+    if [[ "$lock" != "$target" ]]; then
+      printf 'codex-update: %s package-lock.json pins %s, expected %s\n' \
+        "$label" "${lock:-missing}" "$target" >&2
+      return 1
+    fi
+  elif [[ "$label" == staged && -f "$ROOT/package-lock.json" ]]; then
+    printf 'codex-update: staged install did not produce a package-lock.json\n' >&2
+    return 1
+  fi
+
+  if [[ ! -x "$base/node_modules/.bin/codex" ]]; then
+    printf 'codex-update: %s Codex CLI is missing or not executable\n' "$label" >&2
+    return 1
+  fi
+  if ! cli_version="$("$base/node_modules/.bin/codex" --version)"; then
+    printf 'codex-update: %s Codex CLI could not report its version\n' "$label" >&2
+    return 1
+  fi
+  if [[ "$cli_version" != "codex-cli $target" ]]; then
+    printf "codex-update: %s CLI reports '%s', expected 'codex-cli %s'\n" \
+      "$label" "$cli_version" "$target" >&2
+    return 1
+  fi
+}
+
+verify_local_runtime() {
+  local runtime="$1"
+  local target="$2"
+  local label="$3"
+  local actual actual_hash build expected_hash expected_patch_sha actual_patch_sha
+  local release_dir release_name
+
+  if [[ ! -x "$runtime/codex" ]]; then
+    printf 'codex-update: %s local Codex executable is missing or not executable\n' "$label" >&2
+    return 1
+  fi
+  if [[ ! -f "$runtime/build.json" ]]; then
+    printf 'codex-update: %s local build.json is missing\n' "$label" >&2
+    return 1
+  fi
+
+  build="$(build_target "$runtime/build.json")"
+  if [[ "$build" != "$target" ]]; then
+    printf 'codex-update: %s local build records %s, expected %s\n' \
+      "$label" "${build:-missing}" "$target" >&2
+    return 1
+  fi
+
+  expected_patch_sha="$(patch_sha_for "$target")" || return 1
+  actual_patch_sha="$(build_patch_sha "$runtime/build.json")"
+  if [[ "$actual_patch_sha" != "$expected_patch_sha" ]]; then
+    printf 'codex-update: %s local build records patch %s, expected %s\n' \
+      "$label" "${actual_patch_sha:-missing}" "$expected_patch_sha" >&2
+    return 1
+  fi
+
+  release_dir="$(dirname "$(readlink -f "$runtime/codex")")"
+  release_name="$(basename "$release_dir")"
+  if [[ "$release_name" != "$target-"* ]]; then
+    printf 'codex-update: %s local release %s does not target %s\n' \
+      "$label" "${release_name:-missing}" "$target" >&2
+    return 1
+  fi
+
+  if ! actual="$("$runtime/codex" --version)"; then
+    printf 'codex-update: %s local Codex executable could not report its version\n' "$label" >&2
+    return 1
+  fi
+  if [[ "$actual" != "codex-cli $target" ]]; then
+    printf "codex-update: %s local Codex executable reports '%s', expected 'codex-cli %s'\n" \
+      "$label" "$actual" "$target" >&2
+    return 1
+  fi
+
+  expected_hash="$(build_executable_sha "$runtime/build.json")"
+  if [[ -n "$expected_hash" ]]; then
+    actual_hash="$(sha256sum -- "$runtime/codex" | awk '{print $1}')" || return 1
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+      printf 'codex-update: %s local Codex executable checksum does not match build.json\n' \
+        "$label" >&2
+      return 1
+    fi
+  fi
+}
+
+verify_external_runtime() {
+  local target="$1"
+  local actual
+
+  [[ -n "${CODEX_WORKSPACE_BIN:-}" ]] || return 0
+  if [[ ! -x "$CODEX_WORKSPACE_BIN" ]]; then
+    printf 'codex-update: external active Codex executable is missing: %s\n' \
+      "$CODEX_WORKSPACE_BIN" >&2
+    return 1
+  fi
+  if ! actual="$("$CODEX_WORKSPACE_BIN" --version)"; then
+    printf 'codex-update: external active Codex executable could not report its version\n' >&2
+    return 1
+  fi
+  if [[ "$actual" != "codex-cli $target" ]]; then
+    printf "codex-update: external active Codex executable reports '%s', expected 'codex-cli %s'\n" \
+      "$actual" "$target" >&2
+    return 1
+  fi
+}
+
+verify_active_binary_and_wrapper() {
+  local target="$1"
+  local actual expected actual_real expected_real wrapper_version
+
+  printf 'Verifying active Codex executable...\n'
+  if ! actual="$(resolve_codex_bin)"; then
+    return 1
+  fi
+  if [[ ! -x "$actual" ]]; then
+    printf 'codex-update: active Codex executable is missing: %s\n' "$actual" >&2
+    return 1
+  fi
+
+  if [[ -n "${CODEX_WORKSPACE_BIN:-}" ]]; then
+    expected="$CODEX_WORKSPACE_BIN"
+  elif local_runtime_exists; then
+    expected="$LOCAL_CURRENT/codex"
+  else
+    expected="$ROOT/node_modules/.bin/codex"
+  fi
+  actual_real="$(readlink -f "$actual")"
+  expected_real="$(readlink -f "$expected")"
+  if [[ "$actual_real" != "$expected_real" ]]; then
+    printf 'codex-update: resolver selected %s, expected active executable %s\n' \
+      "$actual" "$expected" >&2
+    return 1
+  fi
+
+  if ! actual="$("$actual" --version)"; then
+    printf 'codex-update: active Codex executable could not report its version\n' >&2
+    return 1
+  fi
+  if [[ "$actual" != "codex-cli $target" ]]; then
+    printf "codex-update: active Codex executable reports '%s', expected 'codex-cli %s'\n" \
+      "$actual" "$target" >&2
+    return 1
+  fi
+
+  printf 'Verifying workspace wrapper...\n'
+  if ! wrapper_version="$("$ROOT/codex" --version)"; then
+    printf 'codex-update: workspace wrapper could not report its version\n' >&2
+    return 1
+  fi
+  if [[ "$wrapper_version" != "codex-cli $target" ]]; then
+    printf "codex-update: wrapper reports '%s', expected 'codex-cli %s'\n" \
+      "$wrapper_version" "$target" >&2
+    return 1
+  fi
+
+  printf 'Updated and verified: %s\n' "$wrapper_version"
+}
+
+verify_live_installation() {
+  local target="$1"
+
+  verify_npm_tree "$target" "$ROOT" live || return 1
+  if local_runtime_exists; then
+    verify_local_runtime "$LOCAL_CURRENT" "$target" live || return 1
+  fi
+  verify_external_runtime "$target" || return 1
 
   printf 'Running workspace tests...\n'
   if ! npm test; then
@@ -309,88 +645,106 @@ verify_live_installation() {
     return 1
   fi
 
-  printf 'Verifying local CLI...\n'
-  if ! cli_version="$("$ROOT/node_modules/.bin/codex" --version)"; then
-    printf 'codex-update: local CLI could not report its version\n' >&2
-    return 1
-  fi
-  if [[ "$cli_version" != "codex-cli $target" ]]; then
-    printf "codex-update: local CLI reports '%s', expected 'codex-cli %s'\n" "$cli_version" "$target" >&2
-    return 1
-  fi
-
-  printf 'Verifying workspace wrapper...\n'
-  if ! wrapper_version="$(CODEX_SCHEDULE=off "$ROOT/codex" --version)"; then
-    printf 'codex-update: workspace wrapper could not report its version\n' >&2
-    return 1
-  fi
-  if [[ "$wrapper_version" != "codex-cli $target" ]]; then
-    printf "codex-update: wrapper reports '%s', expected 'codex-cli %s'\n" "$wrapper_version" "$target" >&2
-    return 1
-  fi
-
-  printf 'Updated and verified: %s\n' "$wrapper_version"
+  verify_active_binary_and_wrapper "$target"
 }
 
 verify_staged_installation() {
   local target="$1"
-  local cli_version installed manifest staged_lock
 
-  manifest="$(manifest_version "$STAGE_DIR/package.json")"
-  if [[ "$manifest" != "$target" ]]; then
-    die "staged package.json pins ${manifest:-missing}, expected $target"
+  verify_npm_tree "$target" "$STAGE_DIR" staged || return 1
+  printf 'Staged npm install verified: codex-cli %s\n' "$target"
+}
+
+prepare_local_candidate() {
+  local target="$1"
+  local backup="$STAGE_DIR/local-current.previous"
+  local had_current=0
+
+  [[ -x "$LOCAL_BUILDER" ]] || {
+    printf 'codex-update: local runtime builder is missing or not executable: %s\n' \
+      "$LOCAL_BUILDER" >&2
+    return 1
+  }
+
+  if [[ -e "$LOCAL_CURRENT" || -L "$LOCAL_CURRENT" ]]; then
+    cp -a --no-dereference -- "$LOCAL_CURRENT" "$backup" || return 1
+    had_current=1
   fi
 
-  installed="$(installed_version "$STAGE_DIR/node_modules/@openai/codex/package.json")"
-  if [[ "$installed" != "$target" ]]; then
-    die "staged node_modules contains ${installed:-missing}, expected $target"
+  printf 'Building patched local Codex runtime for %s...\n' "$target"
+  if ! "$LOCAL_BUILDER" "$target"; then
+    remove_path "$LOCAL_CURRENT"
+    if [[ "$had_current" -eq 1 ]]; then
+      mv -- "$backup" "$LOCAL_CURRENT" || return 1
+    fi
+    printf 'codex-update: local runtime candidate build failed; the prior current was restored\n' >&2
+    return 1
   fi
 
-  if [[ -f "$ROOT/package-lock.json" && ! -f "$STAGE_DIR/package-lock.json" ]]; then
-    die "staged install did not produce a package-lock.json"
-  fi
-  if [[ -f "$STAGE_DIR/package-lock.json" ]]; then
-    staged_lock="$(lock_version "$STAGE_DIR/package-lock.json")"
-    [[ "$staged_lock" == "$target" ]] \
-      || die "staged package-lock.json pins ${staged_lock:-missing}, expected $target"
+  if [[ ! -e "$LOCAL_CURRENT" && ! -L "$LOCAL_CURRENT" ]]; then
+    if [[ "$had_current" -eq 1 ]]; then
+      mv -- "$backup" "$LOCAL_CURRENT" || return 1
+    fi
+    printf 'codex-update: local runtime builder did not publish current\n' >&2
+    return 1
   fi
 
-  [[ -x "$STAGE_DIR/node_modules/.bin/codex" ]] \
-    || die "staged Codex CLI is missing or not executable"
-  if ! cli_version="$("$STAGE_DIR/node_modules/.bin/codex" --version)"; then
-    die "staged Codex CLI could not report its version"
+  PENDING_LOCAL_CURRENT="$LOCAL_CURRENT.pending.$$"
+  remove_path "$PENDING_LOCAL_CURRENT"
+  mv -- "$LOCAL_CURRENT" "$PENDING_LOCAL_CURRENT" || return 1
+  if [[ "$had_current" -eq 1 ]]; then
+    if ! mv -- "$backup" "$LOCAL_CURRENT"; then
+      mv -- "$PENDING_LOCAL_CURRENT" "$LOCAL_CURRENT" || true
+      PENDING_LOCAL_CURRENT=""
+      return 1
+    fi
   fi
-  [[ "$cli_version" == "codex-cli $target" ]] \
-    || die "staged CLI reports '$cli_version', expected 'codex-cli $target'"
 
-  printf 'Staged install verified: %s\n' "$cli_version"
+  verify_local_runtime "$PENDING_LOCAL_CURRENT" "$target" candidate || {
+    printf 'codex-update: local runtime candidate validation failed; the prior current remains active\n' >&2
+    return 1
+  }
+  printf 'Patched local runtime candidate verified: codex-cli %s\n' "$target"
 }
 
 promote_staged_installation() {
-  [[ -d "$STAGE_DIR/node_modules" ]] || return 1
+  [[ -n "$PENDING_LOCAL_CURRENT" || -d "$STAGE_DIR/node_modules" ]] || return 1
 
   ROLLBACK_DIR="$(mktemp -d "$ROOT/.codex-update-rollback.XXXXXX")" || return 1
   PROMOTION_STARTED=1
 
-  if [[ -e "$ROOT/node_modules" ]]; then
-    mv -- "$ROOT/node_modules" "$ROLLBACK_DIR/node_modules" || return 1
-    BACKED_UP_NODE_MODULES=1
-  fi
-  mv -- "$STAGE_DIR/node_modules" "$ROOT/node_modules" || return 1
-  PROMOTED_NODE_MODULES=1
+  if [[ -d "$STAGE_DIR/node_modules" ]]; then
+    if [[ -e "$ROOT/node_modules" ]]; then
+      mv -- "$ROOT/node_modules" "$ROLLBACK_DIR/node_modules" || return 1
+      BACKED_UP_NODE_MODULES=1
+    fi
+    mv -- "$STAGE_DIR/node_modules" "$ROOT/node_modules" || return 1
+    PROMOTED_NODE_MODULES=1
 
-  mv -- "$ROOT/package.json" "$ROLLBACK_DIR/package.json" || return 1
-  BACKED_UP_PACKAGE_JSON=1
-  mv -- "$STAGE_DIR/package.json" "$ROOT/package.json" || return 1
-  PROMOTED_PACKAGE_JSON=1
+    mv -- "$ROOT/package.json" "$ROLLBACK_DIR/package.json" || return 1
+    BACKED_UP_PACKAGE_JSON=1
+    mv -- "$STAGE_DIR/package.json" "$ROOT/package.json" || return 1
+    PROMOTED_PACKAGE_JSON=1
 
-  if [[ -f "$ROOT/package-lock.json" ]]; then
-    mv -- "$ROOT/package-lock.json" "$ROLLBACK_DIR/package-lock.json" || return 1
-    BACKED_UP_PACKAGE_LOCK=1
+    if [[ -f "$ROOT/package-lock.json" ]]; then
+      mv -- "$ROOT/package-lock.json" "$ROLLBACK_DIR/package-lock.json" || return 1
+      BACKED_UP_PACKAGE_LOCK=1
+    fi
+    if [[ -f "$STAGE_DIR/package-lock.json" ]]; then
+      mv -- "$STAGE_DIR/package-lock.json" "$ROOT/package-lock.json" || return 1
+      PROMOTED_PACKAGE_LOCK=1
+    fi
   fi
-  if [[ -f "$STAGE_DIR/package-lock.json" ]]; then
-    mv -- "$STAGE_DIR/package-lock.json" "$ROOT/package-lock.json" || return 1
-    PROMOTED_PACKAGE_LOCK=1
+
+  if [[ -n "$PENDING_LOCAL_CURRENT" ]]; then
+    if [[ -e "$LOCAL_CURRENT" || -L "$LOCAL_CURRENT" ]]; then
+      mv -- "$LOCAL_CURRENT" "$ROLLBACK_DIR/current" || return 1
+      BACKED_UP_LOCAL_CURRENT=1
+    fi
+    mkdir -p "$(dirname "$LOCAL_CURRENT")" || return 1
+    mv -- "$PENDING_LOCAL_CURRENT" "$LOCAL_CURRENT" || return 1
+    PROMOTED_LOCAL_CURRENT=1
+    PENDING_LOCAL_CURRENT=""
   fi
 }
 
@@ -399,14 +753,53 @@ LATEST="$(latest_version)" || die "could not query npm for the latest $PACKAGE_N
 
 TARGET="$BUILD_VERSION"
 [[ "$TARGET" == "latest" ]] && TARGET="$LATEST"
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+  patch_sha_for "$TARGET" >/dev/null \
+    || die "no compatible patch series is available for Codex $TARGET"
+fi
 
 MANIFEST="$(manifest_version "$ROOT/package.json")"
 INSTALLED="$(installed_version "$ROOT/node_modules/@openai/codex/package.json")"
+LOCKED="$(lock_version "$ROOT/package-lock.json")"
+LOCAL_BUILD=""
+LOCAL_VERSION=""
+LOCAL_EXECUTABLE_SHA=""
+LOCAL_ACTUAL_SHA=""
+if local_runtime_exists; then
+  LOCAL_BUILD="$(build_target "$LOCAL_CURRENT/build.json")"
+  LOCAL_VERSION="$("$LOCAL_CURRENT/codex" --version 2>/dev/null || true)"
+  LOCAL_EXECUTABLE_SHA="$(build_executable_sha "$LOCAL_CURRENT/build.json")"
+  if [[ -x "$LOCAL_CURRENT/codex" ]]; then
+    LOCAL_ACTUAL_SHA="$(sha256sum -- "$LOCAL_CURRENT/codex" | awk '{print $1}')" || true
+  fi
+fi
+if ! ACTIVE_CODEX_BIN="$(resolve_codex_bin)"; then
+  ACTIVE_CODEX_BIN=""
+  ACTIVE_RESOLUTION_FAILED=1
+fi
+ACTIVE_VERSION=""
+if [[ -n "$ACTIVE_CODEX_BIN" ]]; then
+  ACTIVE_VERSION="$("$ACTIVE_CODEX_BIN" --version 2>/dev/null || true)"
+fi
+NPM_CLI_VERSION="$("$ROOT/node_modules/.bin/codex" --version 2>/dev/null || true)"
 
 printf 'Manifest pin: %s\n' "${MANIFEST:-missing}"
 printf 'Installed:    %s\n' "${INSTALLED:-missing}"
+printf 'Lockfile:     %s\n' "${LOCKED:-missing}"
 printf 'Latest npm:   %s\n' "$LATEST"
 printf 'Target:       %s\n' "$TARGET"
+if local_runtime_exists; then
+  printf 'Local build:  %s\n' "${LOCAL_BUILD:-missing}"
+  printf 'Local binary: %s\n' "${LOCAL_VERSION:-unavailable}"
+else
+  printf 'Local build:  not installed\n'
+  printf 'Local binary: not installed\n'
+fi
+if [[ -n "$ACTIVE_CODEX_BIN" ]]; then
+  printf 'Active binary: %s (%s)\n' "$ACTIVE_CODEX_BIN" "${ACTIVE_VERSION:-unavailable}"
+else
+  printf 'Active binary: unavailable (resolver failed)\n'
+fi
 
 if [[ "$CHECK_ONLY" -eq 0 ]]; then
   LOCK_FILE="/tmp/codex-update-$(printf '%s' "$ROOT" | sha256sum | cut -c1-12).lock"
@@ -422,7 +815,71 @@ else
 fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
-  if [[ "$MANIFEST" == "$LATEST" && "$INSTALLED" == "$LATEST" ]]; then
+  inconsistent=0
+  external_mismatch=0
+  if [[ "$MANIFEST" != "$INSTALLED" \
+    || ( -f "$ROOT/package-lock.json" && "$LOCKED" != "$INSTALLED" ) \
+    || "$NPM_CLI_VERSION" != "codex-cli $INSTALLED" ]]; then
+    inconsistent=1
+  fi
+  if local_runtime_exists; then
+    if [[ ! "$LOCAL_VERSION" =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+ ]] \
+      || [[ "$LOCAL_BUILD" != "${LOCAL_VERSION#codex-cli }" ]]; then
+      inconsistent=1
+    fi
+    if [[ -n "$LOCAL_EXECUTABLE_SHA" \
+      && "$LOCAL_ACTUAL_SHA" != "$LOCAL_EXECUTABLE_SHA" ]]; then
+      inconsistent=1
+    fi
+    local_active="$ACTIVE_CODEX_BIN"
+    if [[ -z "$local_active" ]]; then
+      inconsistent=1
+    elif [[ -z "${CODEX_WORKSPACE_BIN:-}" ]]; then
+      [[ "$(readlink -f "$local_active")" == "$(readlink -f "$LOCAL_CURRENT/codex")" ]] \
+        || inconsistent=1
+    fi
+  elif [[ -z "${CODEX_WORKSPACE_BIN:-}" ]] \
+    && { [[ -z "$ACTIVE_CODEX_BIN" ]] \
+      || [[ "$(readlink -f "$ACTIVE_CODEX_BIN")" != "$(readlink -f "$ROOT/node_modules/.bin/codex")" ]]; }; then
+    inconsistent=1
+  fi
+  [[ "$ACTIVE_RESOLUTION_FAILED" -eq 0 ]] || inconsistent=1
+  [[ "$ACTIVE_VERSION" =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+ ]] || inconsistent=1
+  if [[ -n "${CODEX_WORKSPACE_BIN:-}" \
+    && "$ACTIVE_VERSION" != "codex-cli $TARGET" ]]; then
+    external_mismatch=1
+  fi
+
+  if [[ "$inconsistent" -eq 1 ]]; then
+    printf 'NPM status:    inconsistent\n'
+  elif npm_runtime_matches "$TARGET"; then
+    printf 'NPM status:    current for %s\n' "$TARGET"
+  else
+    printf 'NPM status:    update required for %s\n' "$TARGET"
+  fi
+
+  if ! local_runtime_exists; then
+    printf 'Local status:  not installed\n'
+  elif [[ "$LOCAL_BUILD" == "${LOCAL_VERSION#codex-cli }" ]] \
+    && [[ "$LOCAL_VERSION" =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    if local_runtime_matches "$TARGET"; then
+      printf 'Local status:  current for %s\n' "$TARGET"
+    else
+      printf 'Local status:  update required for %s\n' "$TARGET"
+    fi
+  else
+    printf 'Local status:  inconsistent\n'
+  fi
+
+  if [[ "$external_mismatch" -eq 1 ]]; then
+    printf 'Status:       external active runtime mismatch for %s\n' "$TARGET"
+    exit 1
+  fi
+  if [[ "$inconsistent" -eq 1 ]]; then
+    printf 'Status:       inconsistent; run ./codex update\n'
+    exit 1
+  fi
+  if npm_runtime_matches "$TARGET" && local_runtime_matches "$TARGET"; then
     printf 'Status:       up to date\n'
   else
     printf 'Status:       update available; run ./codex update\n'
@@ -430,33 +887,46 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ "$MANIFEST" == "$TARGET" && "$INSTALLED" == "$TARGET" ]]; then
-  printf 'Dependencies already match %s; verifying installation.\n' "$TARGET"
+if npm_runtime_matches "$TARGET" && local_runtime_matches "$TARGET"; then
+  printf 'Dependencies and local runtime already match %s; verifying installation.\n' "$TARGET"
   verify_live_installation "$TARGET" \
-    || die "live installation verification failed; no files were promoted"
+    || die "live installation version mismatch; no files were promoted"
   exit 0
 fi
 
 mkdir -p "$NPM_CACHE"
 STAGE_DIR="$(mktemp -d "$ROOT/.codex-update-stage.XXXXXX")" \
   || die "could not create a workspace staging directory"
-cp -- "$ROOT/package.json" "$STAGE_DIR/package.json"
-if [[ -f "$ROOT/package-lock.json" ]]; then
-  cp -- "$ROOT/package-lock.json" "$STAGE_DIR/package-lock.json"
+
+if ! npm_runtime_matches "$TARGET"; then
+  cp -- "$ROOT/package.json" "$STAGE_DIR/package.json"
+  if [[ -f "$ROOT/package-lock.json" ]]; then
+    cp -- "$ROOT/package-lock.json" "$STAGE_DIR/package-lock.json"
+  fi
+
+  printf 'Installing %s@%s in staging...\n' "$PACKAGE_NAME" "$TARGET"
+  if ! (
+    cd "$STAGE_DIR"
+    npm install --save-exact --no-audit --no-fund "$PACKAGE_NAME@$TARGET"
+  ); then
+    die "staged install failed; live node_modules, package.json, and package-lock.json were not modified"
+  fi
+
+  verify_staged_installation "$TARGET" \
+    || die "staged npm candidate verification failed; no live files were promoted"
 fi
 
-printf 'Installing %s@%s in staging...\n' "$PACKAGE_NAME" "$TARGET"
-if ! (
-  cd "$STAGE_DIR"
-  npm install --save-exact --no-audit --no-fund "$PACKAGE_NAME@$TARGET"
-); then
-  die "staged install failed; live node_modules, package.json, and package-lock.json were not modified"
-fi
+verify_external_runtime "$TARGET" \
+  || die "external active runtime version mismatch; no live files were promoted"
 
-verify_staged_installation "$TARGET"
+if ! local_runtime_matches "$TARGET"; then
+  prepare_local_candidate "$TARGET" \
+    || die "local runtime candidate verification failed; no live files were promoted"
+fi
 
 # Re-read active processes here: sessions may have started or ended during the
-# staged install and verification.
+# candidate install/builder and verification.
+ACTIVE_CODEX_BIN="$(resolve_codex_bin)" || die "could not re-resolve the active Codex executable"
 ACTIVE="$(active_workspace_codex)"
 if [[ -n "$ACTIVE" ]]; then
   printf 'Active Codex processes for this workspace:\n%s\n' "$ACTIVE"
@@ -473,7 +943,7 @@ fi
 
 if ! verify_live_installation "$TARGET"; then
   if rollback_promotion; then
-    die "post-promotion verification failed; the live installation was rolled back"
+    die "post-promotion verification failed; npm and the local current were rolled back"
   fi
   die "post-promotion verification failed; rollback incomplete and the backup was retained at $ROLLBACK_DIR"
 fi

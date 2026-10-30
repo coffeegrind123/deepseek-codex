@@ -6,7 +6,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-BIN="$ROOT/node_modules/.bin/codex"
 CAGE="$ROOT/sandbox/landlock-exec.py"
 
 # Project-local update path: ./codex update
@@ -14,8 +13,6 @@ if [[ "${1:-}" == "update" ]]; then
   shift
   exec "$ROOT/codex-update" "$@"
 fi
-
-[[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
 
 if [[ "${1:-}" == "balance" ]]; then
   shift
@@ -25,6 +22,9 @@ if [[ "${1:-}" == "balance" ]]; then
   set +a
   exec node "$ROOT/scripts/deepseek-balance.mjs" show "$@"
 fi
+
+BIN="$("$ROOT/scripts/resolve-codex-bin.sh")"
+[[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
 
 "$ROOT/codex-router" ensure >/dev/null
 
@@ -76,16 +76,26 @@ fi
 
 export CODEX_HOME="$ROOT/.codex"
 export TMPDIR="${TMPDIR:-/tmp}"
+export CODEX_MANAGED_PACKAGE_ROOT="$ROOT/node_modules/@openai/codex"
+export CODEX_MANAGED_BY_NPM=1
+export DEEPSEEK_BALANCE_CACHE_FILE="$ROOT/.codex/cache/deepseek-balance.json"
+export PATH="$ROOT/scripts:$PATH"
 
-# Codex has no custom footer/status-line command. Own the window/tab title
-# instead: most terminals surface that title in their taskbar or tab strip.
-# The daemon runs outside the Landlock cage, writes only terminal escape
-# sequences, and exits when the wrapped Codex PID exits.
-if [[ "${CODEX_DEEPSEEK_BALANCE_TITLE:-auto}" != "off" && -t 1 ]]; then
-  node "$ROOT/scripts/deepseek-balance.mjs" title \
-    --parent-pid "$$" \
-    --tty-fd 1 \
-    --project "$work" \
+# Keep the footer cache fresh outside the Landlock cage. The same daemon also
+# owns the window/tab title unless that fallback is explicitly disabled.
+balance_title="${CODEX_DEEPSEEK_BALANCE_TITLE:-auto}"
+balance_args=(
+  title
+  --parent-pid "$$"
+  --tty-fd 1
+  --project "$work"
+  --cache-file "$DEEPSEEK_BALANCE_CACHE_FILE"
+)
+if [[ "$balance_title" == "off" ]]; then
+  balance_args+=(--no-title)
+fi
+if [[ -t 1 ]]; then
+  node "$ROOT/scripts/deepseek-balance.mjs" "${balance_args[@]}" \
     </dev/null >&1 2>/dev/null &
 fi
 
