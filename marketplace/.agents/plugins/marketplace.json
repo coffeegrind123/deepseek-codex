@@ -1,0 +1,9 @@
+{
+  "name": "workspace",
+  "interface": { "displayName": "Workspace plugins" },
+  "plugins": [
+    { "name": "codex-security", "source": { "source": "local", "path": "./plugins/codex-security" } },
+    { "name": "deepseek-balance", "source": { "source": "local", "path": "./plugins/deepseek-balance" } },
+    { "name": "subagent-labels", "source": { "source": "local", "path": "./plugins/subagent-labels" } }
+  ]
+}

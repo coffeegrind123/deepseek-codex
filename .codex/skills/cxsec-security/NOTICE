@@ -1,0 +1,102 @@
+cxsec-security
+Copyright 2026 the cxsec-security contributors
+
+This product includes software and documentation derived from
+codex-security (https://github.com/openai/codex-security),
+Copyright OpenAI, licensed under the Apache License, Version 2.0.
+
+Derived from upstream release npm-v0.6.0, commit
+13dcc6fec00aaf4c23a6fa7e375ccc1726b22836, source path plugins/codex-security.
+(Upstream relocated the plugin from sdk/typescript/_bundled_plugin at 0.1.16+.)
+
+Modifications made to the upstream work
+---------------------------------------
+
+Documentation and skill definitions (SKILL.md, references/):
+
+  * The 14 upstream skills were consolidated into one router skill. Top-level
+    skills became references/mode-*.md; the four phase skills became
+    references/phase-*.md. Their frontmatter was converted to HTML comments.
+  * All reference paths were flattened into a single references/ namespace.
+  * <plugin_dir> / <plugin-root> were replaced with $CXSEC_HOME.
+  * All 143 upstream MCP tool references were converted to file operations. The
+    mapping is documented in references/workbench-file-protocol.md; discovery,
+    validation and attack-path state moved to candidates.jsonl plus per-candidate
+    candidate_ledger.jsonl receipts.
+  * Codex app links were replaced with instructions to verify that a connected
+    MCP server exposes the required tools.
+  * Product branding was removed from prose so mode selection does not depend on
+    an absent product.
+  * references/hard-rules.md corresponds to upstream references/scan-prologue.md
+    (previously references/shared-hard-rules.md), edited to cover repository scans
+    alongside diff and deep scans and to replace upstream's desktop-app,
+    handoff-token and MCP-ownership machinery with the file protocol.
+  * references/core-scan.md is upstream references/core-scan.md, the audit engine
+    that replaced the four-phase pipeline for repository scans in 0.1.16+. Its
+    checkpointing, which upstream performs through record_codex_security_scan_draft,
+    is mapped to checkpoint files under <scan_dir>.
+  * references/mode-deep-scan.md replaces upstream's MCP deep-scan coordinator
+    with locally run Agent rounds, each performing the complete core-scan audit,
+    followed by the same semantic reduction upstream's coordinator performs.
+  * references/threat-model.md is upstream references/threat-model.md, which
+    replaced skills/threat-model/references/threat-model-guidance.md.
+  * references/mode-patch-risk.md and references/risk-rubric.md are upstream
+    skills/assess-patch-risk, added in 0.1.16+.
+  * references/scan-runtime.md is upstream references/scan-runtime.md, adapted to
+    host delegation, with its ChatGPT access advisory removed. It replaces the
+    capability preflight upstream retired in 0.5.0.
+  * references/mode-fix.md also carries upstream skills/verify-fix as its
+    Verify-Only section.
+
+Runtime layout (runtime/):
+
+  * skills/assess-patch-risk/scripts/validate_patch_risk_assessment.py is kept
+    at its upstream depth rather than flattened into scripts/, because it
+    resolves the plugin root as parents[3].
+
+Runtime code (runtime/):
+
+  * assets/0001-rebrand-sarif-output.patch renames four cosmetic SARIF branding
+    sites in scripts/finalize_scan_contract.py: tool.driver.name, the
+    partialFingerprints namespace, and two run.properties keys. Generated SARIF
+    is attributed to cxsec-security.
+  * scripts/deep_scan_defaults.json deliberately overrides upstream's deep-scan
+    defaults with cost-safe local values: workers 2, subagents 1,
+    stopAfterNoNew 3, stopAfterConsecutiveErrors 2, maxDiscoveryRuns 10, and
+    maxTimeHours 1.5. assets/local-additions/scripts/deep_scan_defaults.json is
+    the byte-identical copy restored by install.sh after re-vendoring.
+  * Carried Python helpers (assets/local-additions/, installed into the runtime):
+    resolve_security_md.py, normalize_candidates.py and the patch-risk validator
+    are upstream Python that upstream later deleted; copy_deep_review_input.py and
+    bind_repo_scopes.py re-implement retired generate_rank_input.py subcommands.
+    All five were modified to follow upstream's later TypeScript implementations.
+  * Apart from the declared deep-scan defaults, no functional change to vendored
+    code. Canonical wire literals (codex-security.* documentTypes, the
+    codex-security/v1 fingerprint algorithm, and the codex-security-snapshot/v1
+    digest prefix) are deliberately unchanged so that genuine upstream artifacts
+    remain ingestible.
+
+Not included from upstream
+--------------------------
+
+  * mcp-app/ (the MCP server and its TypeScript sources and tests), native/
+  * the Codex-CLI-driven deep-security-scan coordinator
+  * references/desktop-scan.md, references/standalone-validation.md, and the
+    ChatGPT access advisory (Codex desktop app, MCP server, and hosted account
+    only)
+  * skills/publish-findings and skills/cloud-findings (codex-security CLI and
+    Codex Security Cloud only)
+  * tests/, plugin-files.json, pyproject.toml, requirements-test.txt
+
+Additions original to this work
+-------------------------------
+
+  * scripts/install.sh, assets/, references/install.md,
+    references/workbench-file-protocol.md, agents/openai.yaml, README.md, and
+    this NOTICE.
+  * The Codex adapter removes the unsupported top-level `compatibility`
+    frontmatter key, uses `spawn_agent` terminology for Codex deep-scan rounds,
+    and disables implicit invocation so `$cxsec-security` cannot be confused
+    with the built-in Codex Security deep scan.
+  * tests/: pytest ports of upstream's TypeScript test suites for the carried
+    helpers (sdk/typescript/tests-ts and plugins/codex-security/mcp-app/tests).

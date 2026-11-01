@@ -1,0 +1,41 @@
+{
+  "routes": [
+    {
+      "name": "deepseek",
+      "match": "deepseek-",
+      "base": "https://api.deepseek.com",
+      "keyEnv": "DEEPSEEK_API_KEY",
+      "fallbackModel": "glm-5.3"
+    },
+    {
+      "name": "zai-5.3-flash",
+      "match": "glm-5.3-flash",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY",
+      "fallbackModel": "glm-5-turbo",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+    },
+    {
+      "name": "zai-turbo",
+      "match": "glm-5-turbo",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+    },
+    {
+      "name": "zai-5.3",
+      "match": "glm-5.3",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY",
+      "fallbackModel": "glm-5.3-flash",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+    },
+    {
+      "name": "zai",
+      "match": "glm-",
+      "base": "https://api.z.ai/api/v1",
+      "keyEnv": "ZAI_API_KEY",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+    }
+  ]
+}

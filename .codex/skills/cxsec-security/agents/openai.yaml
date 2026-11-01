@@ -1,0 +1,6 @@
+interface:
+  display_name: "CxSec Security"
+  short_description: "File-based security review toolkit with a no-coordinator deep scan."
+
+policy:
+  allow_implicit_invocation: true

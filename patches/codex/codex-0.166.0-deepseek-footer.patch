@@ -1,0 +1,1497 @@
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+index 6ec41a9..e75633d 100644
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -966,6 +966,10 @@ pub struct Tui {
+     #[serde(default)]
+     pub status_line: Option<Vec<String>>,
+ 
++    /// External commands that contribute one footer status-line item each.
++    #[serde(default)]
++    pub status_line_commands: BTreeMap<String, TuiStatusLineCommand>,
++
+     /// Color status line items with colors derived from the active syntax theme.
+     /// Defaults to `true`.
+     #[serde(default = "default_true")]
+@@ -1035,6 +1039,37 @@ pub struct Tui {
+     pub terminal_resize_reflow_max_rows: Option<usize>,
+ }
+ 
++/// A bounded external command used as one configurable status-line item.
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
++#[schemars(deny_unknown_fields)]
++pub struct TuiStatusLineCommand {
++    /// Argv for the command. Executed directly without shell interpolation.
++    #[schemars(length(min = 1))]
++    pub command: Vec<String>,
++
++    /// Minimum time between completed refreshes.
++    #[serde(default = "default_status_line_command_refresh_interval_ms")]
++    #[schemars(range(min = 1))]
++    pub refresh_interval_ms: u64,
++
++    /// Maximum runtime before the command is terminated.
++    #[serde(default = "default_status_line_command_timeout_ms")]
++    #[schemars(range(min = 1))]
++    pub timeout_ms: u64,
++
++    /// Text to show before the first successful refresh or after a failure.
++    #[serde(default)]
++    pub fallback: Option<String>,
++}
++
++const fn default_status_line_command_refresh_interval_ms() -> u64 {
++    60_000
++}
++
++const fn default_status_line_command_timeout_ms() -> u64 {
++    10_000
++}
++
+ const fn default_true() -> bool {
+     true
+ }
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 0e741b6..e4dcc9d 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -5431,6 +5431,14 @@
+           },
+           "type": "array"
+         },
++        "status_line_commands": {
++          "additionalProperties": {
++            "$ref": "#/definitions/TuiStatusLineCommand"
++          },
++          "default": {},
++          "description": "External commands that contribute one footer status-line item each.",
++          "type": "object"
++        },
+         "status_line_use_colors": {
+           "default": true,
+           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
+@@ -6596,6 +6604,43 @@
+       },
+       "type": "object"
+     },
++    "TuiStatusLineCommand": {
++      "additionalProperties": false,
++      "description": "A bounded external command used as one configurable status-line item.",
++      "properties": {
++        "command": {
++          "description": "Argv for the command. Executed directly without shell interpolation.",
++          "items": {
++            "type": "string"
++          },
++          "minItems": 1,
++          "type": "array"
++        },
++        "fallback": {
++          "default": null,
++          "description": "Text to show before the first successful refresh or after a failure.",
++          "type": "string"
++        },
++        "refresh_interval_ms": {
++          "default": 60000,
++          "description": "Minimum time between completed refreshes.",
++          "format": "uint64",
++          "minimum": 1.0,
++          "type": "integer"
++        },
++        "timeout_ms": {
++          "default": 10000,
++          "description": "Maximum runtime before the command is terminated.",
++          "format": "uint64",
++          "minimum": 1.0,
++          "type": "integer"
++        }
++      },
++      "required": [
++        "command"
++      ],
++      "type": "object"
++    },
+     "TuiVimNormalKeymap": {
+       "additionalProperties": false,
+       "description": "Vim normal-mode keybindings for modal editing inside text areas.\n\nActions that use uppercase letters (like `A` for append-line-end) should be specified as `shift-a` in config; the runtime matcher handles cross-terminal shift-reporting differences automatically.",
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 309e2d3..6b6edf8 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1412,6 +1412,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             right_click_paste: Default::default(),
+             alternate_screen: AltScreenMode::default(),
+             status_line: None,
++            status_line_commands: BTreeMap::new(),
+             status_line_use_colors: true,
+             terminal_title: None,
+             theme: None,
+@@ -1449,6 +1450,64 @@ status_line_use_colors = false
+     );
+ }
+ 
++#[test]
++fn config_toml_deserializes_status_line_commands() {
++    let toml = r#"
++[tui]
++status_line = ["model-with-reasoning", "deepseek-balance"]
++
++[tui.status_line_commands.deepseek-balance]
++command = ["node", "/workspace/scripts/deepseek-balance.mjs", "status"]
++refresh_interval_ms = 90000
++timeout_ms = 2500
++fallback = "DeepSeek unavailable"
++"#;
++    let cfg: ConfigToml =
++        toml::from_str(toml).expect("TOML deserialization should succeed for status commands");
++    let tui = cfg.tui.expect("tui config should deserialize");
++
++    assert_eq!(
++        tui.status_line,
++        Some(vec![
++            "model-with-reasoning".to_string(),
++            "deepseek-balance".to_string(),
++        ])
++    );
++    assert_eq!(
++        tui.status_line_commands.get("deepseek-balance"),
++        Some(&codex_config::types::TuiStatusLineCommand {
++            command: vec![
++                "node".to_string(),
++                "/workspace/scripts/deepseek-balance.mjs".to_string(),
++                "status".to_string(),
++            ],
++            refresh_interval_ms: 90_000,
++            timeout_ms: 2_500,
++            fallback: Some("DeepSeek unavailable".to_string()),
++        })
++    );
++}
++
++#[test]
++fn status_line_command_defaults_refresh_and_timeout() {
++    let toml = r#"
++[tui.status_line_commands.balance]
++command = ["balance"]
++"#;
++    let cfg: ConfigToml =
++        toml::from_str(toml).expect("TOML deserialization should apply command defaults");
++    let command = cfg
++        .tui
++        .expect("tui config should deserialize")
++        .status_line_commands
++        .remove("balance")
++        .expect("balance command");
++
++    assert_eq!(command.refresh_interval_ms, 60_000);
++    assert_eq!(command.timeout_ms, 10_000);
++    assert_eq!(command.fallback, None);
++}
++
+ #[test]
+ fn config_toml_deserializes_terminal_resize_reflow_config() {
+     let toml = r#"
+@@ -4662,6 +4721,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             right_click_paste: Default::default(),
+             alternate_screen: AltScreenMode::Auto,
+             status_line: None,
++            status_line_commands: BTreeMap::new(),
+             status_line_use_colors: true,
+             terminal_title: None,
+             theme: None,
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index eb949b8..7e5829b 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -862,6 +862,9 @@ pub struct Config {
+     /// Whether to color status line items with colors from the active syntax theme.
+     pub tui_status_line_use_colors: bool,
+ 
++    /// External commands that contribute status-line items.
++    pub tui_status_line_commands: BTreeMap<String, codex_config::types::TuiStatusLineCommand>,
++
+     /// Ordered list of terminal title item identifiers for the TUI.
+     ///
+     /// When unset, the TUI defaults to: `activity` and `project`.
+@@ -4815,6 +4818,11 @@ impl Config {
+                 .as_ref()
+                 .map(|t| t.status_line_use_colors)
+                 .unwrap_or(true),
++            tui_status_line_commands: cfg
++                .tui
++                .as_ref()
++                .map(|t| t.status_line_commands.clone())
++                .unwrap_or_default(),
+             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
+             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+             tui_pet: cfg.tui.as_ref().and_then(|t| t.pet.clone()),
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index 1ced86e..79b7ac9 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -301,6 +301,7 @@ async fn new_config(
+         tui_right_click_paste: Default::default(),
+         tui_alternate_screen: AltScreenMode::Auto,
+         tui_status_line: None,
++        tui_status_line_commands: Default::default(),
+         tui_status_line_use_colors: true,
+         tui_terminal_title: None,
+         tui_theme: None,
+diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
+index 47968b8..764bfee 100644
+--- a/codex-rs/tui/Cargo.toml
++++ b/codex-rs/tui/Cargo.toml
+@@ -111,6 +111,7 @@ tempfile = { workspace = true }
+ textwrap = { workspace = true }
+ thiserror = { workspace = true }
+ tokio = { workspace = true, features = [
++    "io-util",
+     "io-std",
+     "macros",
+     "process",
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 550965d..725f7f8 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -58,6 +58,7 @@ impl App {
+                 &event,
+                 AppEvent::OpenDaemonMenu
+                     | AppEvent::OpenWarnings
++                    | AppEvent::StatusLineCommandUpdated { .. }
+                     | AppEvent::StatusLineSetup { .. }
+                     | AppEvent::StatusLineSetupCancelled
+                     | AppEvent::TerminalTitleSetup { .. }
+@@ -3364,7 +3365,7 @@ impl App {
+                 items,
+                 use_theme_colors,
+             } => {
+-                let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
++                let ids = items;
+                 let items_edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
+                 let colors_edit =
+                     crate::legacy_core::config::edit::status_line_use_colors_edit(use_theme_colors);
+@@ -3376,7 +3377,7 @@ impl App {
+                     Ok(()) => {
+                         self.local_settings.tui.status_line = Some(ids.clone());
+                         self.local_settings.tui.status_line_use_colors = use_theme_colors;
+-                        self.chat_widget.setup_status_line(items, use_theme_colors);
++                        self.chat_widget.setup_status_line(ids, use_theme_colors);
+                         self.chat_widget.refresh_config_panel(/*notice*/ None);
+                     }
+                     Err(err) => {
+@@ -3404,6 +3405,15 @@ impl App {
+                     tui.frame_requester().schedule_frame();
+                 }
+             }
++            AppEvent::StatusLineCommandUpdated { token, id, output } => {
++                if self
++                    .chat_widget
++                    .set_status_line_command_output(token, id, output)
++                {
++                    self.refresh_status_line();
++                    tui.frame_requester().schedule_frame();
++                }
++            }
+             AppEvent::StatusLineSetupCancelled => {
+                 self.chat_widget.cancel_status_line_setup();
+                 self.chat_widget.refresh_config_panel(/*notice*/ None);
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index a2d2191..872647a 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -2176,7 +2176,7 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
+ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() {
+     let mut app = make_test_app().await;
+     app.chat_widget.setup_status_line(
+-        vec![crate::bottom_pane::StatusLineItem::ContextWindowSize],
++        vec![crate::bottom_pane::StatusLineItem::ContextWindowSize.to_string()],
+         /*use_theme_colors*/ true,
+     );
+ 
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 2adc303..47e8c63 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -51,7 +51,6 @@ use uuid::Uuid;
+ use crate::app_command::AppCommand;
+ use crate::app_server_session::AppServerStartedThread;
+ use crate::bottom_pane::ApprovalRequest;
+-use crate::bottom_pane::StatusLineItem;
+ use crate::bottom_pane::TerminalTitleItem;
+ use crate::chatwidget::AstraModelPickerAction;
+ use crate::chatwidget::ConfiguredPetLoadGeneration;
+@@ -1647,9 +1646,15 @@ pub(crate) enum AppEvent {
+         request_id: u64,
+         result: Result<crate::workspace_messages::WorkspaceHeadlineFetchResult, String>,
+     },
++    /// Async update from one configured command-backed status-line item.
++    StatusLineCommandUpdated {
++        token: u64,
++        id: String,
++        output: Option<String>,
++    },
+     /// Apply a user-confirmed status-line item ordering/selection.
+     StatusLineSetup {
+-        items: Vec<StatusLineItem>,
++        items: Vec<String>,
+         use_theme_colors: bool,
+     },
+     /// Dismiss the status-line setup UI without changing config.
+diff --git a/codex-rs/tui/src/app_event_sender.rs b/codex-rs/tui/src/app_event_sender.rs
+index 0057b90..47ac699 100644
+--- a/codex-rs/tui/src/app_event_sender.rs
++++ b/codex-rs/tui/src/app_event_sender.rs
+@@ -55,6 +55,7 @@ impl AppEventSender {
+                     | AppEvent::BackgroundVoiceError { .. }
+                     | AppEvent::SyncThreadGitBranch { .. }
+                     | AppEvent::RefreshRateLimits { .. }
++                    | AppEvent::StatusLineCommandUpdated { .. }
+             )
+         {
+             return;
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index c4ca02c..8805232 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -23,6 +23,7 @@
+ 
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
++use std::collections::BTreeMap;
+ use std::collections::HashSet;
+ use strum::IntoEnumIterator;
+ use strum_macros::Display;
+@@ -39,6 +40,7 @@ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
+ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
+ use crate::keymap::ListKeymap;
+ use crate::render::renderable::Renderable;
++use codex_config::types::TuiStatusLineCommand;
+ 
+ const STATUS_LINE_USE_THEME_COLORS_ITEM_ID: &str = "status-line-use-theme-colors";
+ 
+@@ -300,6 +302,7 @@ impl StatusLineSetupView {
+     /// enabled. Remaining items are appended and marked as disabled.
+     pub(crate) fn new(
+         status_line_items: Option<&[String]>,
++        status_line_commands: &BTreeMap<String, TuiStatusLineCommand>,
+         use_theme_colors: bool,
+         preview_data: StatusSurfacePreviewData,
+         app_event_tx: AppEventSender,
+@@ -315,20 +318,31 @@ impl StatusLineSetupView {
+             section_break_after: true,
+         }];
+ 
++        let mut command_previews = BTreeMap::new();
++        for (id, command) in status_line_commands {
++            let preview = command
++                .fallback
++                .as_deref()
++                .and_then(crate::status_line_command::sanitize)
++                .unwrap_or_else(|| id.clone());
++            command_previews.insert(id.clone(), preview);
++        }
++
+         if let Some(selected_items) = status_line_items.as_ref() {
+             for id in *selected_items {
+-                let Ok(item) = id.parse::<StatusLineItem>() else {
+-                    continue;
+-                };
+-                let item_id = item.to_string();
+-                if !used_ids.insert(item_id.clone()) {
++                let item = id.parse::<StatusLineItem>().ok();
++                let item_id = item.map_or_else(|| id.clone(), |item| item.to_string());
++                if (item.is_none() && !status_line_commands.contains_key(id))
++                    || !used_ids.insert(item_id)
++                {
+                     continue;
+                 }
+-                items.push(Self::status_line_select_item(
+-                    item,
+-                    /*enabled*/ true,
+-                    &preview_data,
+-                ));
++                items.push(match item {
++                    Some(item) => {
++                        Self::status_line_select_item(item, /*enabled*/ true, &preview_data)
++                    }
++                    None => Self::status_line_command_select_item(id, /*enabled*/ true),
++                });
+             }
+         }
+ 
+@@ -343,6 +357,13 @@ impl StatusLineSetupView {
+                 &preview_data,
+             ));
+         }
++        for id in status_line_commands.keys() {
++            if used_ids.insert(id.clone()) {
++                items.push(Self::status_line_command_select_item(
++                    id, /*enabled*/ false,
++                ));
++            }
++        }
+ 
+         Self {
+             picker: MultiSelectPicker::builder(
+@@ -359,13 +380,17 @@ impl StatusLineSetupView {
+                     .find(|item| item.id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID)
+                     .map(|item| item.enabled)
+                     .unwrap_or(true);
+-                preview_data.status_line_for_items(
+-                    items
+-                        .iter()
+-                        .filter(|item| item.enabled)
+-                        .filter_map(|item| item.id.parse::<StatusLineItem>().ok()),
+-                    use_theme_colors,
+-                )
++                let segments = items.iter().filter(|item| item.enabled).filter_map(|item| {
++                    if let Ok(status_item) = item.id.parse::<StatusLineItem>() {
++                        return preview_data
++                            .value_for(status_item.preview_item())
++                            .map(|value| (status_item, value.to_string()));
++                    }
++                    command_previews
++                        .get(&item.id)
++                        .map(|value| (StatusLineItem::EstimatedThreadCost, value.clone()))
++                });
++                preview_data.status_line_for_segments(segments, use_theme_colors)
+             })
+             .on_confirm(|ids, app_event| {
+                 let use_theme_colors = ids
+@@ -373,7 +398,8 @@ impl StatusLineSetupView {
+                     .any(|id| id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID);
+                 let items = ids
+                     .iter()
+-                    .filter_map(|id| id.parse::<StatusLineItem>().ok())
++                    .filter(|id| id.as_str() != STATUS_LINE_USE_THEME_COLORS_ITEM_ID)
++                    .cloned()
+                     .collect::<Vec<_>>();
+                 app_event.send(AppEvent::StatusLineSetup {
+                     items,
+@@ -412,6 +438,18 @@ impl StatusLineSetupView {
+             section_break_after: false,
+         }
+     }
++
++    /// Builds a selectable item for a command-backed status-line entry.
++    fn status_line_command_select_item(id: &str, enabled: bool) -> MultiSelectItem {
++        MultiSelectItem {
++            id: id.to_string(),
++            name: id.to_string(),
++            description: Some("Configured command-backed status item".to_string()),
++            enabled,
++            orderable: true,
++            section_break_after: false,
++        }
++    }
+ }
+ 
+ impl BottomPaneView for StatusLineSetupView {
+@@ -708,6 +746,7 @@ mod tests {
+                 StatusLineItem::CurrentDir.to_string(),
+                 StatusLineItem::GitBranch.to_string(),
+             ]),
++            &BTreeMap::new(),
+             /*use_theme_colors*/ true,
+             StatusSurfacePreviewData::from_iter([
+                 (
+@@ -734,6 +773,47 @@ mod tests {
+         assert_snapshot!(render_lines(&view, /*width*/ 72));
+     }
+ 
++    #[test]
++    fn setup_view_preserves_configured_command_item() {
++        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
++        let commands = BTreeMap::from([(
++            "deepseek-balance".to_string(),
++            TuiStatusLineCommand {
++                command: vec!["deepseek-balance".to_string(), "status".to_string()],
++                refresh_interval_ms: 60_000,
++                timeout_ms: 10_000,
++                fallback: Some("DeepSeek $18.75 USD".to_string()),
++            },
++        )]);
++        let mut view = StatusLineSetupView::new(
++            Some(&["deepseek-balance".to_string()]),
++            &commands,
++            /*use_theme_colors*/ true,
++            StatusSurfacePreviewData::default(),
++            AppEventSender::new(tx_raw),
++            crate::keymap::RuntimeKeymap::defaults().list,
++        );
++
++        let rendered = render_lines(&view, /*width*/ 72);
++        assert!(rendered.contains("deepseek-balance"));
++        assert!(rendered.contains("DeepSeek $18.75 USD"));
++
++        view.handle_key_event(crossterm::event::KeyEvent::new(
++            crossterm::event::KeyCode::Enter,
++            crossterm::event::KeyModifiers::NONE,
++        ));
++        match rx.try_recv() {
++            Ok(AppEvent::StatusLineSetup {
++                items,
++                use_theme_colors,
++            }) => {
++                assert_eq!(items, vec!["deepseek-balance".to_string()]);
++                assert!(use_theme_colors);
++            }
++            _ => panic!("expected status-line setup event"),
++        }
++    }
++
+     #[test]
+     fn setup_view_snapshot_includes_thread_usage_items() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+@@ -742,6 +822,7 @@ mod tests {
+                 StatusLineItem::ThreadCredits.to_string(),
+                 StatusLineItem::EstimatedThreadCost.to_string(),
+             ]),
++            &BTreeMap::new(),
+             /*use_theme_colors*/ true,
+             StatusSurfacePreviewData::from_iter([
+                 (
+@@ -768,6 +849,7 @@ mod tests {
+                 StatusLineItem::Hostname.to_string(),
+                 StatusLineItem::CurrentDir.to_string(),
+             ]),
++            &BTreeMap::new(),
+             /*use_theme_colors*/ true,
+             StatusSurfacePreviewData::from_iter([
+                 (
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index d940ecb..3656add 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -242,6 +242,7 @@ impl StatusSurfacePreviewData {
+             .map(|value| value.text.as_str())
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn status_line_for_items<I>(
+         &self,
+         items: I,
+@@ -256,6 +257,17 @@ impl StatusSurfacePreviewData {
+         });
+         status_line_from_segments(segments, use_theme_colors, self.thread_id)
+     }
++
++    pub(crate) fn status_line_for_segments<I>(
++        &self,
++        segments: I,
++        use_theme_colors: bool,
++    ) -> Option<Line<'static>>
++    where
++        I: IntoIterator<Item = (StatusLineItem, String)>,
++    {
++        status_line_from_segments(segments, use_theme_colors, self.thread_id)
++    }
+ }
+ 
+ struct RateLimitPreviewCopy {
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 68868be..4acbc95 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -761,6 +761,14 @@ pub(crate) struct ChatWidget {
+     terminal_title_animation_origin: Instant,
+     // The foreground loop refreshes the title at this deadline without drawing a frame.
+     pub(crate) terminal_title_next_refresh: Option<Instant>,
++    // Last sanitized result for each selected command-backed status-line item.
++    status_line_command_outputs: BTreeMap<String, StatusLineCommandState>,
++    // Active refresh loops, keyed by command ID.
++    status_line_command_tasks: BTreeMap<String, tokio::task::JoinHandle<()>>,
++    // Tokens that scope asynchronous command results to the loop that produced them.
++    status_line_command_tokens: BTreeMap<String, u64>,
++    // Inputs that determine the currently running command loops.
++    status_line_command_targets: Vec<StatusLineCommandTarget>,
+     // Cached project-root display name keyed by cwd for status/title rendering.
+     status_line_project_root_name_cache: Option<CachedProjectRootName>,
+     // Cached git branch name for the status line (None if unknown).
+@@ -809,6 +817,12 @@ enum CodexOpTarget {
+     AppEvent,
+ }
+ 
++#[derive(Default)]
++struct StatusLineCommandState {
++    last_success: Option<String>,
++    stale: bool,
++}
++
+ /// Snapshot of active-cell state that affects transcript overlay rendering.
+ ///
+ /// The overlay keeps a cached "live tail" for the in-flight cell; this key lets
+@@ -2092,6 +2106,9 @@ fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {
+ 
+ impl Drop for ChatWidget {
+     fn drop(&mut self) {
++        for (_, task) in std::mem::take(&mut self.status_line_command_tasks) {
++            task.abort();
++        }
+         if self.realtime_conversation.handle.is_some()
+             && let Some(thread_id) = self.thread_id
+         {
+@@ -2106,6 +2123,8 @@ impl Drop for ChatWidget {
+ const PLACEHOLDER: &str = "Ask Codex to do anything";
+ const SIDE_PLACEHOLDER: &str = "Ask a follow-up question";
+ 
++type StatusLineCommandTarget = (String, Vec<String>, PathBuf, u64, u64);
++
+ // Extract the first bold (Markdown) element in the form **...** from `s`.
+ // Returns the inner text if found; otherwise `None`.
+ pub(crate) fn extract_first_bold(s: &str) -> Option<String> {
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 7b2d08c..7a6d048 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -275,6 +275,10 @@ impl ChatWidget {
+             status_surface_overrides: StatusSurfaceOverrides::default(),
+             terminal_title_animation_origin: Instant::now(),
+             terminal_title_next_refresh: None,
++            status_line_command_outputs: BTreeMap::new(),
++            status_line_command_tasks: BTreeMap::new(),
++            status_line_command_tokens: BTreeMap::new(),
++            status_line_command_targets: Vec::new(),
+             status_line_project_root_name_cache: None,
+             status_line_branch: None,
+             status_line_branch_cwd: None,
+diff --git a/codex-rs/tui/src/chatwidget/quick_dials.rs b/codex-rs/tui/src/chatwidget/quick_dials.rs
+index cf702a3..5bba57e 100644
+--- a/codex-rs/tui/src/chatwidget/quick_dials.rs
++++ b/codex-rs/tui/src/chatwidget/quick_dials.rs
+@@ -146,11 +146,12 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn current_terminal_title_quick_dial(&self) -> Result<QuickDial, &'static str> {
+-        status_surface_quick_dial::<TerminalTitleItem>(
++        status_surface_quick_dial::<TerminalTitleItem, _>(
+             "/title",
+             self.configured_terminal_title_items(),
+             /*suffix*/ None,
+             "Choose available terminal-title items with /title before saving.",
++            |_| false,
+         )
+     }
+ 
+@@ -160,11 +161,17 @@ impl ChatWidget {
+         } else {
+             "--no-colors"
+         };
+-        status_surface_quick_dial::<StatusLineItem>(
++        status_surface_quick_dial::<StatusLineItem, _>(
+             "/statusline",
+             self.configured_status_line_items(),
+             /*suffix*/ Some(colors),
+             "Choose available status-line items with /statusline before saving.",
++            |id| {
++                self.local_settings
++                    .tui
++                    .status_line_commands
++                    .contains_key(id)
++            },
+         )
+     }
+ 
+@@ -594,21 +601,23 @@ impl ChatWidget {
+     }
+ }
+ 
+-fn status_surface_quick_dial<T>(
++fn status_surface_quick_dial<T, F>(
+     command: &str,
+     item_ids: Vec<String>,
+     suffix: Option<&str>,
+     invalid_items_error: &'static str,
++    is_custom_item: F,
+ ) -> Result<QuickDial, &'static str>
+ where
+     T: std::str::FromStr + ToString,
++    F: Fn(&str) -> bool,
+ {
+     let items = item_ids
+         .into_iter()
+-        .map(|id| {
+-            id.parse::<T>()
+-                .map(|item| item.to_string())
+-                .map_err(|_| invalid_items_error)
++        .map(|id| match id.parse::<T>() {
++            Ok(item) => Ok(item.to_string()),
++            Err(_) if is_custom_item(&id) => Ok(id),
++            Err(_) => Err(invalid_items_error),
+         })
+         .collect::<Result<Vec<_>, _>>()?;
+     let mut input = command.to_string();
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index 046c55b..527a386 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -125,11 +125,10 @@ impl ChatWidget {
+     /// Applies status-line item selection from the setup view to in-memory config.
+     ///
+     /// An empty selection persists as an explicit empty list.
+-    pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineItem>, use_theme_colors: bool) {
++    pub(crate) fn setup_status_line(&mut self, ids: Vec<String>, use_theme_colors: bool) {
+         tracing::info!(
+-            "status line setup confirmed with items: {items:#?}, use_theme_colors: {use_theme_colors}"
++            "status line setup confirmed with items: {ids:#?}, use_theme_colors: {use_theme_colors}"
+         );
+-        let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+         self.config_panel_tui.status_line = Some(ids.clone());
+         self.config_panel_tui.status_line_use_colors = use_theme_colors;
+         self.local_settings.tui.status_line = Some(ids);
+@@ -341,8 +340,10 @@ impl ChatWidget {
+ 
+     pub(super) fn open_status_line_setup(&mut self) {
+         let configured_status_line_items = self.configured_status_line_items();
++        let status_line_commands = self.local_settings.tui.status_line_commands.clone();
+         let view = StatusLineSetupView::new(
+             Some(configured_status_line_items.as_slice()),
++            &status_line_commands,
+             self.local_settings.tui.status_line_use_colors,
+             self.status_surface_preview_data(),
+             self.app_event_tx.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/status_surface_commands.rs b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+index caf0ab1..8121459 100644
+--- a/codex-rs/tui/src/chatwidget/status_surface_commands.rs
++++ b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+@@ -16,7 +16,7 @@ pub(super) struct StatusSurfaceOverrides {
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ struct StatusLineCommand {
+-    items: Option<Vec<StatusLineItem>>,
++    items: Option<Vec<String>>,
+     use_theme_colors: Option<bool>,
+ }
+ 
+@@ -37,10 +37,13 @@ impl ChatWidget {
+ 
+     pub(super) fn handle_status_line_command_args(&mut self, args: &str) {
+         let preview_data = self.status_surface_preview_data();
+-        match parse_status_line_command(args, &preview_data) {
++        match parse_status_line_command(
++            args,
++            &preview_data,
++            &self.local_settings.tui.status_line_commands,
++        ) {
+             Ok(command) => {
+-                if let Some(items) = command.items {
+-                    let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
++                if let Some(ids) = command.items {
+                     self.status_surface_overrides.status_line = Some(ids.clone());
+                     self.local_settings.tui.status_line = Some(ids);
+                 }
+@@ -90,12 +93,16 @@ fn parse_terminal_title_command(
+ fn parse_status_line_command(
+     args: &str,
+     preview_data: &StatusSurfacePreviewData,
++    status_line_commands: &std::collections::BTreeMap<
++        String,
++        codex_config::types::TuiStatusLineCommand,
++    >,
+ ) -> Result<StatusLineCommand, String> {
+     let args = slash_command_args::parse(args, &[], &["--clear"], &["colors"])?;
+     let items = args
+         .positionals
+         .iter()
+-        .map(|item| parse_item(item, "status-line", "/statusline", preview_data))
++        .map(|item| parse_status_line_item(item, preview_data, status_line_commands))
+         .collect::<Result<Vec<_>, _>>()?;
+     Ok(StatusLineCommand {
+         items: status_line_items(items, args.has_switch("--clear"))?,
+@@ -103,10 +110,7 @@ fn parse_status_line_command(
+     })
+ }
+ 
+-fn status_line_items(
+-    items: Vec<StatusLineItem>,
+-    clear: bool,
+-) -> Result<Option<Vec<StatusLineItem>>, String> {
++fn status_line_items(items: Vec<String>, clear: bool) -> Result<Option<Vec<String>>, String> {
+     if clear && !items.is_empty() {
+         return Err("Cannot combine --clear with status-line items.".into());
+     }
+@@ -119,6 +123,24 @@ fn status_line_items(
+     })
+ }
+ 
++fn parse_status_line_item(
++    token: &str,
++    preview_data: &StatusSurfacePreviewData,
++    status_line_commands: &std::collections::BTreeMap<
++        String,
++        codex_config::types::TuiStatusLineCommand,
++    >,
++) -> Result<String, String> {
++    if let Ok(item) = token.parse::<StatusLineItem>() {
++        return Ok(item.to_string());
++    }
++    if status_line_commands.contains_key(token) {
++        return Ok(token.to_string());
++    }
++    parse_item::<StatusLineItem>(token, "status-line", "/statusline", preview_data)
++        .map(|item| item.to_string())
++}
++
+ fn parse_item<T>(
+     token: &str,
+     surface: &str,
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 997c3a2..f0d73b3 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -14,6 +14,7 @@ use crate::status::format_credit_micros;
+ use crate::status::format_estimated_usd_micros;
+ use crate::status::format_tokens_compact;
+ use crate::status::thread_cost_micros;
++use crate::status_line_command;
+ use crate::terminal_program_status::ProgramStatus;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_config::ConfigLayerSource;
+@@ -43,6 +44,24 @@ const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1)
+ /// Prefix shown in the terminal title when the agent is blocked on user input.
+ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
+ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Required";
++const MIN_STATUS_LINE_COMMAND_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
++const MAX_STATUS_LINE_COMMAND_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
++const MIN_STATUS_LINE_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
++const MAX_STATUS_LINE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
++static NEXT_STATUS_LINE_COMMAND_TOKEN: std::sync::atomic::AtomicU64 =
++    std::sync::atomic::AtomicU64::new(1);
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++enum StatusLineEntry {
++    Builtin(StatusLineItem),
++    Command(String),
++}
++
++impl StatusLineEntry {
++    fn is_builtin(&self, expected: StatusLineItem) -> bool {
++        *self == Self::Builtin(expected)
++    }
++}
+ 
+ #[derive(Debug)]
+ /// Parsed status-surface configuration for one refresh pass.
+@@ -52,7 +71,7 @@ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Require
+ /// refresh pass compute those shared concerns once, then render both surfaces
+ /// from the same selection set.
+ struct StatusSurfaceSelections {
+-    status_line_items: Vec<StatusLineItem>,
++    status_line_items: Vec<StatusLineEntry>,
+     invalid_status_line_items: Vec<String>,
+     terminal_title_items: Vec<TerminalTitleItem>,
+     invalid_terminal_title_items: Vec<String>,
+@@ -60,30 +79,34 @@ struct StatusSurfaceSelections {
+ 
+ impl StatusSurfaceSelections {
+     fn uses_git_branch(&self) -> bool {
+-        self.status_line_items.contains(&StatusLineItem::GitBranch)
++        self.status_line_items
++            .iter()
++            .any(|item| item.is_builtin(StatusLineItem::GitBranch))
+             || self
+                 .terminal_title_items
+                 .contains(&TerminalTitleItem::GitBranch)
+     }
+ 
+     fn uses_git_summary(&self) -> bool {
+-        self.status_line_items
+-            .contains(&StatusLineItem::PullRequestNumber)
+-            || self
+-                .status_line_items
+-                .contains(&StatusLineItem::BranchChanges)
++        self.status_line_items.iter().any(|item| {
++            item.is_builtin(StatusLineItem::PullRequestNumber)
++                || item.is_builtin(StatusLineItem::BranchChanges)
++        })
+     }
+ 
+     fn uses_workspace_headline(&self) -> bool {
+         self.status_line_items
+-            .contains(&StatusLineItem::WorkspaceHeadline)
++            .iter()
++            .any(|item| item.is_builtin(StatusLineItem::WorkspaceHeadline))
+     }
+ 
+     fn uses_thread_usage(&self) -> bool {
+         self.status_line_items.iter().any(|item| {
+             matches!(
+                 item,
+-                StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
++                StatusLineEntry::Builtin(
++                    StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
++                )
+             )
+         }) || self.terminal_title_items.iter().any(|item| {
+             matches!(
+@@ -199,6 +222,8 @@ impl ChatWidget {
+         } else {
+             self.cancel_thread_usage_polling();
+         }
++
++        self.start_selected_status_line_commands(&selections.status_line_items);
+     }
+ 
+     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+@@ -211,9 +236,17 @@ impl ChatWidget {
+         }
+ 
+         let mut segments = Vec::new();
+-        for item in &selections.status_line_items {
+-            if let Some(value) = self.status_line_value_for_item(*item) {
+-                segments.push((*item, value));
++        for entry in &selections.status_line_items {
++            let value = match entry {
++                StatusLineEntry::Builtin(item) => self.status_line_value_for_item(*item),
++                StatusLineEntry::Command(id) => self.status_line_command_value(id),
++            };
++            if let Some(value) = value {
++                let style_item = match entry {
++                    StatusLineEntry::Builtin(item) => *item,
++                    StatusLineEntry::Command(_) => StatusLineItem::EstimatedThreadCost,
++                };
++                segments.push((style_item, value));
+             }
+         }
+ 
+@@ -224,7 +257,8 @@ impl ChatWidget {
+         ));
+         let hyperlink_url = selections
+             .status_line_items
+-            .contains(&StatusLineItem::PullRequestNumber)
++            .iter()
++            .any(|item| item.is_builtin(StatusLineItem::PullRequestNumber))
+             .then(|| self.status_line_pull_request_url())
+             .flatten();
+         self.set_status_line_hyperlink(hyperlink_url);
+@@ -470,8 +504,31 @@ impl ChatWidget {
+     /// Parses configured status-line ids into known items and collects unknown ids.
+     ///
+     /// Unknown ids are deduplicated in insertion order for warning messages.
+-    fn status_line_items_with_invalids(&self) -> (Vec<StatusLineItem>, Vec<String>) {
+-        parse_items_with_invalids(self.configured_status_line_items())
++    fn status_line_items_with_invalids(&self) -> (Vec<StatusLineEntry>, Vec<String>) {
++        let mut invalid = Vec::new();
++        let mut invalid_seen = HashSet::new();
++        let items = self
++            .configured_status_line_items()
++            .into_iter()
++            .filter_map(|id| {
++                if let Ok(item) = id.parse::<StatusLineItem>() {
++                    return Some(StatusLineEntry::Builtin(item));
++                }
++                if self
++                    .local_settings
++                    .tui
++                    .status_line_commands
++                    .contains_key(&id)
++                {
++                    return Some(StatusLineEntry::Command(id));
++                }
++                if invalid_seen.insert(id.clone()) {
++                    invalid.push(format!(r#""{id}""#));
++                }
++                None
++            })
++            .collect();
++        (items, invalid)
+     }
+ 
+     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
+@@ -642,6 +699,110 @@ impl ChatWidget {
+         });
+     }
+ 
++    fn start_selected_status_line_commands(&mut self, selections: &[StatusLineEntry]) {
++        let cwd = self.status_line_cwd().to_path_buf();
++        let mut targets = selections
++            .iter()
++            .filter_map(|entry| match entry {
++                StatusLineEntry::Command(id) => Some(id),
++                StatusLineEntry::Builtin(_) => None,
++            })
++            .filter_map(|id| {
++                let config = self.local_settings.tui.status_line_commands.get(id)?;
++                Some((
++                    id.clone(),
++                    config.command.clone(),
++                    cwd.clone(),
++                    config.refresh_interval_ms,
++                    config.timeout_ms,
++                ))
++            })
++            .collect::<Vec<_>>();
++        targets.sort_by(|left, right| left.0.cmp(&right.0));
++
++        if self.status_line_command_targets == targets {
++            return;
++        }
++
++        for (_, task) in std::mem::take(&mut self.status_line_command_tasks) {
++            task.abort();
++        }
++        self.status_line_command_tokens.clear();
++        self.status_line_command_outputs.clear();
++        self.status_line_command_targets = targets.clone();
++
++        for (id, command, cwd, refresh_interval_ms, timeout_ms) in targets {
++            let token =
++                NEXT_STATUS_LINE_COMMAND_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            let task_id = id.clone();
++            self.status_line_command_tokens.insert(id.clone(), token);
++            let tx = self.app_event_tx.clone();
++            let task = tokio::spawn(async move {
++                let timeout = Duration::from_millis(timeout_ms).clamp(
++                    MIN_STATUS_LINE_COMMAND_TIMEOUT,
++                    MAX_STATUS_LINE_COMMAND_TIMEOUT,
++                );
++                let refresh_interval = Duration::from_millis(refresh_interval_ms).clamp(
++                    MIN_STATUS_LINE_COMMAND_REFRESH_INTERVAL,
++                    MAX_STATUS_LINE_COMMAND_REFRESH_INTERVAL,
++                );
++                loop {
++                    let output = status_line_command::run(&command, &cwd, timeout).await;
++                    let event = AppEvent::StatusLineCommandUpdated {
++                        id: task_id.clone(),
++                        token,
++                        output,
++                    };
++                    tx.send(event);
++                    if tx.app_event_tx.is_closed() {
++                        break;
++                    }
++                    tokio::time::sleep(refresh_interval).await;
++                }
++            });
++            self.status_line_command_tasks.insert(id, task);
++        }
++    }
++
++    pub(crate) fn set_status_line_command_output(
++        &mut self,
++        token: u64,
++        id: String,
++        output: Option<String>,
++    ) -> bool {
++        if self.status_line_command_tokens.get(&id) != Some(&token) {
++            return false;
++        }
++        let state = self.status_line_command_outputs.entry(id).or_default();
++        if let Some(output) = output {
++            state.last_success = Some(output);
++            state.stale = false;
++        } else {
++            state.stale = true;
++        }
++        true
++    }
++
++    fn status_line_command_value(&self, id: &str) -> Option<String> {
++        let last_success = self.status_line_command_outputs.get(id).and_then(|state| {
++            state.last_success.as_ref().map(|value| {
++                if state.stale {
++                    format!("{value} (stale)")
++                } else {
++                    value.clone()
++                }
++            })
++        });
++        last_success.or_else(|| {
++            self.local_settings
++                .tui
++                .status_line_commands
++                .get(id)
++                .and_then(|config| config.fallback.as_deref())
++                .and_then(status_line_command::sanitize)
++        })
++    }
++
+     fn request_status_line_workspace_headline_if_due(&mut self, now: Instant) {
+         if !self.status_line_workspace_headline_should_fetch(now) {
+             return;
+@@ -679,7 +840,8 @@ impl ChatWidget {
+             && self
+                 .status_line_items_with_invalids()
+                 .0
+-                .contains(&StatusLineItem::WorkspaceHeadline)
++                .iter()
++                .any(|item| item.is_builtin(StatusLineItem::WorkspaceHeadline))
+         {
+             self.refresh_status_line();
+         }
+@@ -712,7 +874,8 @@ impl ChatWidget {
+             && self
+                 .status_line_items_with_invalids()
+                 .0
+-                .contains(&StatusLineItem::WorkspaceHeadline)
++                .iter()
++                .any(|item| item.is_builtin(StatusLineItem::WorkspaceHeadline))
+         {
+             self.frame_requester
+                 .schedule_frame_in(crate::workspace_messages::WORKSPACE_HEADLINE_REFRESH_INTERVAL);
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 9074c5e..79f7003 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -120,6 +120,55 @@ async fn resumed_session_hides_unknown_token_usage_until_an_update_arrives() {
+     );
+ }
+ 
++#[tokio::test]
++async fn command_backed_status_line_uses_cached_output_and_fallback() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.status_line = Some(vec!["deepseek-balance".to_string()]);
++    chat.local_settings.tui.status_line_commands.insert(
++        "deepseek-balance".to_string(),
++        codex_config::types::TuiStatusLineCommand {
++            command: vec!["deepseek-balance".to_string(), "status".to_string()],
++            refresh_interval_ms: 60_000,
++            timeout_ms: 10_000,
++            fallback: Some("DeepSeek unavailable".to_string()),
++        },
++    );
++
++    chat.refresh_status_line();
++    assert_eq!(
++        status_line_text(&chat),
++        Some("DeepSeek unavailable".to_string())
++    );
++
++    let token = *chat
++        .status_line_command_tokens
++        .get("deepseek-balance")
++        .expect("status command token");
++    chat.set_status_line_command_output(
++        token,
++        "deepseek-balance".to_string(),
++        Some("DeepSeek $18.75 USD".to_string()),
++    );
++    chat.refresh_status_line();
++    assert_eq!(
++        status_line_text(&chat),
++        Some("DeepSeek $18.75 USD".to_string())
++    );
++
++    assert!(!chat.set_status_line_command_output(
++        token.wrapping_add(1),
++        "deepseek-balance".to_string(),
++        None,
++    ));
++    assert!(chat.set_status_line_command_output(token, "deepseek-balance".to_string(), None,));
++    assert!(chat.set_status_line_command_output(token, "deepseek-balance".to_string(), None,));
++    chat.refresh_status_line();
++    assert_eq!(
++        status_line_text(&chat),
++        Some("DeepSeek $18.75 USD (stale)".to_string())
++    );
++}
++
+ #[tokio::test]
+ async fn app_server_cyber_policy_error_renders_dedicated_notice() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(Some("gpt-5.6-sol")).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_command_tests.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_command_tests.rs
+index 8574c4f..d2fbcf3 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_command_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_command_tests.rs
+@@ -194,7 +194,7 @@ async fn session_status_surface_overrides_follow_thread_state_and_editor_saves()
+ 
+     restored.setup_terminal_title(vec![TerminalTitleItem::Project]);
+     restored.setup_status_line(
+-        vec![StatusLineItem::ModelName],
++        vec![StatusLineItem::ModelName.to_string()],
+         /*use_theme_colors*/ true,
+     );
+     assert_eq!(
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 1b0b08c..61aefa2 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -221,6 +221,7 @@ mod startup_presentation;
+ mod startup_recovery;
+ mod status;
+ mod status_indicator_widget;
++mod status_line_command;
+ mod streaming;
+ mod style;
+ mod subscription;
+diff --git a/codex-rs/tui/src/local_settings.rs b/codex-rs/tui/src/local_settings.rs
+index 1d0d7eb..65883de 100644
+--- a/codex-rs/tui/src/local_settings.rs
++++ b/codex-rs/tui/src/local_settings.rs
+@@ -75,6 +75,7 @@ impl LocalSettings {
+                 right_click_paste: config.tui_right_click_paste,
+                 alternate_screen: config.tui_alternate_screen,
+                 status_line: config.tui_status_line.clone(),
++                status_line_commands: config.tui_status_line_commands.clone(),
+                 status_line_use_colors: config.tui_status_line_use_colors,
+                 terminal_title: config.tui_terminal_title.clone(),
+                 theme: config.tui_theme.clone(),
+diff --git a/codex-rs/tui/src/status_line_command.rs b/codex-rs/tui/src/status_line_command.rs
+new file mode 100644
+index 0000000..8e298be
+--- /dev/null
++++ b/codex-rs/tui/src/status_line_command.rs
+@@ -0,0 +1,263 @@
++use std::path::Path;
++use std::process::Stdio;
++use std::time::Duration;
++
++use tokio::io::AsyncReadExt;
++use tokio::process::Command;
++use tokio::time::Instant;
++
++const MAX_STATUS_LINE_COMMAND_BYTES: usize = 4 * 1024;
++const MAX_STATUS_LINE_COMMAND_CHARS: usize = 240;
++
++/// Runs one configured status-line command and returns a compact, single-line value.
++pub(crate) async fn run(argv: &[String], cwd: &Path, timeout: Duration) -> Option<String> {
++    let (program, args) = argv.split_first()?;
++    if program.is_empty() {
++        return None;
++    }
++
++    let mut command = Command::new(program);
++    command
++        .args(args)
++        .current_dir(cwd)
++        .stdin(Stdio::null())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true);
++    #[cfg(unix)]
++    command.process_group(/*pgroup*/ 0);
++
++    let mut child = command.spawn().ok()?;
++    let child_pid = child.id();
++    let Some(mut stdout) = child.stdout.take() else {
++        terminate(&mut child, child_pid).await;
++        return None;
++    };
++
++    let deadline = Instant::now() + timeout;
++    let mut output = Vec::with_capacity(MAX_STATUS_LINE_COMMAND_BYTES);
++    let mut chunk = [0_u8; 1024];
++    loop {
++        if output.len() >= MAX_STATUS_LINE_COMMAND_BYTES {
++            terminate(&mut child, child_pid).await;
++            return None;
++        }
++        let read = match tokio::time::timeout_at(deadline, stdout.read(&mut chunk)).await {
++            Ok(Ok(read)) => read,
++            Ok(Err(_)) | Err(_) => {
++                terminate(&mut child, child_pid).await;
++                return None;
++            }
++        };
++        if read == 0 {
++            break;
++        }
++        let remaining = MAX_STATUS_LINE_COMMAND_BYTES - output.len();
++        if read > remaining {
++            terminate(&mut child, child_pid).await;
++            return None;
++        }
++        output.extend_from_slice(&chunk[..read]);
++    }
++    drop(stdout);
++
++    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
++        Ok(Ok(status)) => status,
++        Ok(Err(_)) | Err(_) => {
++            terminate(&mut child, child_pid).await;
++            return None;
++        }
++    };
++    if !status.success() {
++        terminate_process_group(child_pid);
++        return None;
++    }
++    terminate_process_group(child_pid);
++
++    sanitize(&String::from_utf8_lossy(&output))
++}
++
++async fn terminate(child: &mut tokio::process::Child, child_pid: Option<u32>) {
++    terminate_process_group(child_pid);
++    let _ = child.start_kill();
++    let _ = child.wait().await;
++}
++
++fn terminate_process_group(child_pid: Option<u32>) {
++    #[cfg(unix)]
++    if let Some(pid) = child_pid {
++        // SAFETY: process_group(0) assigned the child its own group. The group ID remains
++        // reserved while any descendant is still a member.
++        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
++    }
++    #[cfg(not(unix))]
++    let _ = child_pid;
++}
++
++/// Converts command output into one control-free display segment.
++pub(crate) fn sanitize(raw: &str) -> Option<String> {
++    let first_line = raw.lines().find(|line| !line.trim().is_empty())?;
++    let plain = strip_ansi(first_line);
++    let normalized = plain
++        .chars()
++        .filter(|character| {
++            !character.is_control()
++                && !matches!(
++                    character,
++                    '\u{200b}'..='\u{200f}'
++                        | '\u{202a}'..='\u{202e}'
++                        | '\u{2066}'..='\u{2069}'
++                        | '\u{feff}'
++                )
++        })
++        .collect::<String>()
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" ");
++    if normalized.is_empty() {
++        return None;
++    }
++
++    let mut text = normalized
++        .chars()
++        .take(MAX_STATUS_LINE_COMMAND_CHARS)
++        .collect::<String>();
++    if normalized.chars().count() > MAX_STATUS_LINE_COMMAND_CHARS {
++        text.pop();
++        text.push('…');
++    }
++    Some(text)
++}
++
++fn strip_ansi(raw: &str) -> String {
++    let mut output = String::with_capacity(raw.len());
++    let mut chars = raw.chars().peekable();
++    while let Some(character) = chars.next() {
++        if character == '\u{1b}' {
++            match chars.peek().copied() {
++                Some('[') => {
++                    chars.next();
++                    consume_csi(&mut chars);
++                }
++                Some(']') => {
++                    chars.next();
++                    consume_osc(&mut chars);
++                }
++                Some(_) => {
++                    chars.next();
++                }
++                None => {}
++            }
++            continue;
++        }
++        if character == '\u{009b}' {
++            consume_csi(&mut chars);
++            continue;
++        }
++        output.push(character);
++    }
++    output
++}
++
++fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
++    for character in chars.by_ref() {
++        if ('@'..='~').contains(&character) {
++            break;
++        }
++    }
++}
++
++fn consume_osc(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
++    let mut previous = '\0';
++    for character in chars.by_ref() {
++        if character == '\u{0007}' || (previous == '\u{1b}' && character == '\\') {
++            break;
++        }
++        previous = character;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn sanitizes_ansi_and_uses_first_nonempty_line() {
++        assert_eq!(
++            sanitize("\u{1b}[32mDeepSeek\u{1b}[0m\n$18.75\tUSD\nsecret"),
++            Some("DeepSeek".to_string())
++        );
++    }
++
++    #[test]
++    fn strips_osc_sequences_without_panicking() {
++        assert_eq!(
++            sanitize("\u{1b}]0;title\u{0007}DeepSeek $18.75"),
++            Some("DeepSeek $18.75".to_string())
++        );
++        assert_eq!(sanitize("DeepSeek\u{1b}[31"), Some("DeepSeek".to_string()));
++    }
++
++    #[test]
++    fn removes_bidi_and_other_control_characters() {
++        assert_eq!(
++            sanitize("DeepSeek\u{202e} \u{0007}$18.75\u{feff}"),
++            Some("DeepSeek $18.75".to_string())
++        );
++    }
++
++    #[test]
++    fn rejects_blank_output() {
++        assert_eq!(sanitize(" \n\t\n"), None);
++    }
++
++    #[test]
++    fn caps_oversized_output() {
++        let output = sanitize(&"x".repeat(300)).expect("non-empty output");
++        assert_eq!(output.chars().count(), MAX_STATUS_LINE_COMMAND_CHARS);
++        assert!(output.ends_with('…'));
++    }
++
++    #[tokio::test]
++    async fn runs_argv_and_returns_sanitized_stdout() {
++        let argv = vec![
++            "sh".to_string(),
++            "-c".to_string(),
++            "printf '\\033[32mDeepSeek\\033[0m\\n$18.75 USD\\n'".to_string(),
++        ];
++        assert_eq!(
++            run(&argv, &std::env::temp_dir(), Duration::from_secs(1)).await,
++            Some("DeepSeek".to_string())
++        );
++    }
++
++    #[tokio::test]
++    async fn rejects_oversized_output_without_waiting_for_the_process() {
++        let argv = vec![
++            "sh".to_string(),
++            "-c".to_string(),
++            "yes x | head -c 8192; sleep 5".to_string(),
++        ];
++        let started = Instant::now();
++        assert_eq!(
++            run(&argv, &std::env::temp_dir(), Duration::from_secs(10)).await,
++            None
++        );
++        assert!(started.elapsed() < Duration::from_secs(2));
++    }
++
++    #[tokio::test]
++    async fn ignores_nonzero_exit_and_timed_out_commands() {
++        let nonzero = vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()];
++        assert_eq!(
++            run(&nonzero, &std::env::temp_dir(), Duration::from_secs(1)).await,
++            None
++        );
++
++        let slow = vec!["sh".to_string(), "-c".to_string(), "sleep 2".to_string()];
++        assert_eq!(
++            run(&slow, &std::env::temp_dir(), Duration::from_millis(10)).await,
++            None
++        );
++    }
++}
