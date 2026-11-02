@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# `codex` inside a herdr pane. scripts/ovis.sh puts this directory first on the
+# herdr server's PATH, and every pane inherits it, so a codex typed into a pane
+# or started there by Ovis (which types `codex` at the pane's prompt) runs
+# through ./codex: router, secrets, the Landlock cage, the patched build — the
+# same session a plain launch gets.
+#
+# This directory leaves PATH before ./codex runs, so a `codex` that Codex itself
+# runs (the verifier hook's `codex exec`) is not routed through here again.
+
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+p=":$PATH:"
+while [[ "$p" == *":$shim_dir:"* ]]; do
+  p="${p//:$shim_dir:/:}"
+done
+p="${p#:}"
+PATH="${p%:}"
+export PATH
+exec "$shim_dir/../../codex" "$@"

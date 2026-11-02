@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""team-solve: several fresh-context roles solve one problem through files on disk.
+
+    team_solve.py run    [--dir D] [--mode loop|agents] [options]   solve; exit 0 when every sample passes
+    team_solve.py check  [--dir D]                                  strict sample check (check-samples.sh)
+    team_solve.py status [--dir D]                                  the last run's result and token totals
+
+The problem folder holds the statement (task.md, or problem.md, or --problem FILE) and
+paired public samples tests/N.in + tests/N.out (plus tests/func_name for a LeetCode-style
+starter-code problem). The run writes plan.md, notes.md, tasks.json, solution.py (or
+answer.md for --spec aime|math500|gpqa|hle), final-test-output.log and .team-solve/.
+
+Exit status: 0 solved (every sample passes / an ANSWER line exists), 1 not solved,
+2 usage or infrastructure error (router down, no token, a role that could not run).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from teamsolve import ledger, parse, prompts, samples  # noqa: E402
+
+EXIT_SOLVED = 0
+EXIT_UNSOLVED = 1
+EXIT_ERROR = 2
+PROBLEM_FILES = ("task.md", "problem.md")
+DEFAULT_MODEL = "deepseek-flash"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def duration(text):
+    """'90', '90s', '10m', '4h' -> seconds."""
+    text = str(text).strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(text[-1:], None)
+    return int(float(text[:-1]) * mult) if mult else int(float(text))
+
+
+def find_problem(ws, explicit):
+    if explicit:
+        p = explicit if os.path.isabs(explicit) else os.path.join(ws, explicit)
+        if not os.path.isfile(p):
+            raise SystemExit(f"team-solve: problem file not found: {p}")
+        return p
+    for name in PROBLEM_FILES:
+        p = os.path.join(ws, name)
+        if os.path.isfile(p):
+            return p
+    raise SystemExit(f"team-solve: no {' or '.join(PROBLEM_FILES)} in {ws} (or pass --problem FILE)")
+
+
+def balance_snapshot():
+    path = os.environ.get("DEEPSEEK_BALANCE_CACHE_FILE") or os.path.join(
+        HERE, "..", "..", "..", "cache", "deepseek-balance.json")
+    try:
+        d = json.load(open(path))
+        return {"fetched_at": d.get("fetched_at"), "total_usd": (d.get("balance") or {}).get("total_usd"),
+                "stale": d.get("stale")}
+    except (OSError, ValueError):
+        return None
+
+
+def strict_verdict(ws, spec_kind, verifier=None):
+    if verifier is None and spec_kind != "code":
+        ans = ledger.read(ws, "answer.md")
+        return (EXIT_SOLVED if parse.ANS_RE.search(ans) else EXIT_UNSOLVED), None
+    with open(os.path.join(ws, "final-test-output.log"), "w") as f:
+        failures = verifier.verdict(ws, f) if verifier is not None else samples.check(ws, out=f)
+    return (EXIT_SOLVED if failures == 0 else EXIT_UNSOLVED), failures
+
+
+def cmd_run(a):
+    if os.environ.get("TEAM_SOLVE_ROLE"):
+        log(f"team-solve: refusing to start a team run inside role '{os.environ['TEAM_SOLVE_ROLE']}' "
+            f"of another one")
+        return EXIT_ERROR
+    ws = os.path.abspath(a.dir)
+    problem_path = find_problem(ws, a.problem)
+    problem = open(problem_path).read()
+    if a.wrap_lcb:
+        problem = prompts.lcb_prompt(problem.strip())
+    # A custom verification command makes the task generic; use the neutral solver spec
+    # unless the user named one explicitly.
+    if a.verify_cmd and a.spec == "code":
+        a.spec = "generic"
+    spec = prompts.SPECS[a.spec]
+    verifier = build_verifier(a)
+    if a.verify_cmd:
+        log(f"team-solve: ground truth is the command `{a.verify_cmd}` (exit 0 = solved)")
+    elif spec["kind"] == "code" and not samples.load(ws):
+        log(f"team-solve: WARNING: no tests/*.in in {ws} and no --verify-cmd: the loop gets no "
+            f"verdicts and the final check fails by design")
+    if not a.verify_cmd and spec["kind"] == "code" and samples.func_name(ws) and a.samples != "all" and a.mode == "loop":
+        log("team-solve: tests/func_name present: the authors' loop runs stdin samples only; "
+            "pass --samples all to give the manager functional sample verdicts")
+
+    started = time.time()
+    bal0 = balance_snapshot()
+    with ledger.Lock(ws):
+        if a.fresh:
+            calls = ledger.state_path(ws, "calls")
+            if os.path.isdir(calls) and os.listdir(calls):
+                dest = ledger.state_path(ws, "stale", "fresh-" + time.strftime("%Y%m%d-%H%M%S"))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                os.replace(calls, dest)
+                log(f"team-solve: --fresh: previous calls moved to {os.path.relpath(dest, ws)}")
+        if a.mode == "loop":
+            result = run_loop(a, ws, problem, spec, verifier)
+        else:
+            result = run_agents(a, ws, problem_path, verifier)
+        if result.get("error"):
+            write_run(ws, a, result, started, bal0, None, None)
+            log(f"team-solve: {result['error']}")
+            return EXIT_ERROR
+        code, failures = strict_verdict(ws, spec["kind"], verifier)
+        write_run(ws, a, result, started, bal0, code, failures)
+    if spec["kind"] == "code":
+        sys.stdout.write(ledger.read(ws, "final-test-output.log"))
+    log(f"team-solve: {'SOLVED' if code == EXIT_SOLVED else 'NOT SOLVED'} -- "
+        f"{os.path.relpath(os.path.join(ws, '.team-solve', 'run.json'))}")
+    return code
+
+
+def build_verifier(a):
+    """None (default) means the sample check; --verify-cmd means a CommandVerifier."""
+    from teamsolve import verify
+    if a.verify_cmd:
+        return verify.CommandVerifier(a.verify_cmd, duration(a.verify_timeout))
+    return None
+
+
+def run_loop(a, ws, problem, spec, verifier):
+    from teamsolve import client, loop
+    try:
+        c = client.RouterClient(a.model, a.max_output_tokens, a.effort, a.top_p, a.top_k,
+                                a.attempts, duration(a.call_timeout), log=log)
+    except client.CallError as e:
+        return {"error": str(e)}
+    ok, detail = c.health()
+    if not ok:
+        return {"error": f"router not reachable at {client.router_base()} ({detail}); "
+                         f"start it with ./codex-router ensure"}
+    calls = ledger.Calls(ws, c, log, replay=True)
+    opts = loop.Options(max_iters=a.max_iters, max_tasks=a.max_tasks, strict_format=a.strict_format,
+                        include_functional=a.samples == "all", keep_best=a.keep_best, stress=a.stress,
+                        stress_cases=a.stress_cases, stress_attempts=a.stress_attempts,
+                        python=a.python, model=a.model, solution_file=a.solution_file)
+    try:
+        result = loop.Team(ws, problem, spec, calls.chat, opts, log, verifier).run()
+    except client.CallError as e:
+        return {"error": f"model call failed: {e}", "calls": calls.n}
+    result.update(calls=calls.n, live_calls=calls.live, replayed_calls=calls.replayed, tokens=calls.tokens)
+    return result
+
+
+def run_agents(a, ws, problem_path, verifier):
+    from teamsolve import agents
+    rel = os.path.relpath(problem_path, ws)
+    run = agents.AgentRun(ws, rel, a.model, a.effort, log, a.fresh, duration(a.role_timeout),
+                          verify_cmd=a.verify_cmd or None, verifier=verifier)
+    result = run.run()
+    if result.get("failed_step") not in (None, "verify"):
+        result["error"] = f"agent step '{result['failed_step']}' failed; logs in .team-solve/agents/"
+    return result
+
+
+def write_run(ws, a, result, started, bal0, code, failures):
+    bal1 = balance_snapshot()
+    rec = {"finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seconds": int(time.time() - started),
+           "options": {k: v for k, v in vars(a).items() if k != "func"}, "result": result,
+           "exit": code, "final_failures": failures, "balance_before": bal0, "balance_after": bal1}
+    if bal0 and bal1 and bal0.get("fetched_at") != bal1.get("fetched_at"):
+        try:
+            rec["balance_delta_usd"] = round(float(bal0["total_usd"]) - float(bal1["total_usd"]), 4)
+        except (TypeError, ValueError):
+            pass
+    ledger.write(ws, os.path.join(ledger.STATE_DIR, "run.json"), json.dumps(rec, indent=1, default=str))
+
+
+def cmd_check(a):
+    ws = os.path.abspath(a.dir)
+    if getattr(a, "verify_cmd", None):
+        from teamsolve import verify
+        failures = verify.CommandVerifier(a.verify_cmd, duration(a.verify_timeout)).verdict(ws, sys.stdout)
+    else:
+        failures = samples.check(ws, python=a.python)
+    return EXIT_SOLVED if failures == 0 else EXIT_UNSOLVED
+
+
+def cmd_status(a):
+    ws = os.path.abspath(a.dir)
+    p = ledger.state_path(ws, "run.json")
+    if not os.path.exists(p):
+        print(f"no run recorded in {ws}")
+        return EXIT_ERROR
+    rec = json.load(open(p))
+    r = rec.get("result") or {}
+    o = rec.get("options") or {}
+    print(f"mode {o.get('mode')}  model {o.get('model')}  spec {o.get('spec')}  "
+          f"finished {rec.get('finished_at')}  {rec.get('seconds')}s")
+    ground = f"command `{o.get('verify_cmd')}`" if o.get("verify_cmd") else "samples"
+    print(f"ground truth: {ground}")
+    fcount = rec.get("final_failures")
+    print(f"verdict: {'SOLVED' if rec.get('exit') == 0 else 'NOT SOLVED'}"
+          + (f"  (check failures: {fcount})" if fcount is not None else ""))
+    if o.get("mode") == "loop":
+        print(f"rounds {r.get('rounds')}  manager_done {r.get('manager_done')}  finalized {r.get('finalized')}  "
+              f"stopped {r.get('stopped')}  cutoffs {r.get('cutoffs')}")
+        print(f"calls {r.get('calls')} ({r.get('live_calls')} live, {r.get('replayed_calls')} replayed)  "
+              f"tokens {r.get('tokens')}")
+        if o.get("keep_best"):
+            print(f"keep-best: best round {r.get('best_round')}  restored {r.get('restored_best')}")
+        if o.get("stress"):
+            print(f"stress: {'on' if r.get('stress') else 'disabled: ' + str(r.get('stress_reason'))}")
+        for h in r.get("history") or []:
+            verdict = h.get("check") or h.get("samples")
+            print(f"  round {h['round']}: check {verdict}  stress {h.get('stress')}  task: {h['task'][:90]}")
+    else:
+        print(f"steps {r.get('steps')}  failed_step {r.get('failed_step')}  initial_status "
+              f"{r.get('initial_status')}  usage {r.get('usage')}")
+    if "balance_delta_usd" in rec:
+        print(f"DeepSeek balance change during the run: ${rec['balance_delta_usd']} "
+              f"(account-wide; includes any other session's spend)")
+    return EXIT_SOLVED if rec.get("exit") == 0 else EXIT_UNSOLVED
+
+
+def parser():
+    ap = argparse.ArgumentParser(prog="team-solve", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", default=".", help="problem folder (default: cwd)")
+    common.add_argument("--python", default=sys.executable, help="interpreter that runs solution.py")
+
+    r = sub.add_parser("run", parents=[common], help="solve the problem in --dir")
+    r.add_argument("--mode", choices=("loop", "agents"), default="loop",
+                   help="loop: the authors' one-call-per-role loop (default); agents: memdoor's "
+                        "eight steps, each a fresh codex exec agent")
+    r.add_argument("--problem", help="statement file (default: task.md, else problem.md)")
+    r.add_argument("--spec", choices=sorted(prompts.SPECS), default="code",
+                   help="role prompts: code (default), generic (any command-checkable task), or a "
+                        "math/QA spec from the authors' bench. --verify-cmd implies generic.")
+    r.add_argument("--verify-cmd",
+                   help="the command that decides success (run in --dir; exit 0 = solved, its output "
+                        "feeds the manager). Replaces the sample check: the team iterates until it passes. "
+                        "In agents mode the roles edit the whole workspace; in loop mode they write one "
+                        "Python file (--solution-file).")
+    r.add_argument("--verify-timeout", default="30m", help="wall clock for one --verify-cmd run")
+    r.add_argument("--solution-file", default="",
+                   help="loop mode: the file the single-file solution is written to (default solution.py)")
+    r.add_argument("--wrap-lcb", action="store_true",
+                   help="wrap a bare statement in LiveCodeBench's stdin framing, as the authors' bench did")
+    r.add_argument("--model", default=DEFAULT_MODEL)
+    r.add_argument("--effort", default="high", help="reasoning effort sent with every call (''=omit)")
+    r.add_argument("--max-output-tokens", type=int, default=128000, help="reply cap per call (authors: 128K)")
+    r.add_argument("--top-p", type=float, default=0.95, help="authors' value; --top-p -1 omits it")
+    r.add_argument("--top-k", type=int, default=None, help="omitted by default (a Qwen generation-config value)")
+    r.add_argument("--max-iters", type=int, default=10)
+    r.add_argument("--max-tasks", type=int, default=12)
+    r.add_argument("--strict-format", choices=("auto", "on", "off"), default="auto")
+    r.add_argument("--samples", choices=("stdin", "all"), default="stdin",
+                   help="all: also run functional (tests/func_name) samples inside the loop")
+    r.add_argument("--keep-best", action="store_true", help="restore the last sample-passing program if the final one fails")
+    r.add_argument("--stress", action="store_true", help="validate programs against a generated brute force")
+    r.add_argument("--stress-cases", type=int, default=200)
+    r.add_argument("--stress-attempts", type=int, default=2)
+    r.add_argument("--attempts", type=int, default=4, help="attempts per model call")
+    r.add_argument("--call-timeout", default="4h", help="wall clock per model call (memdoor: 4h)")
+    r.add_argument("--role-timeout", default="10m", help="agents mode: wall clock per role (memdoor: 10m)")
+    r.add_argument("--fresh", action="store_true", help="discard recorded calls instead of replaying them")
+    r.set_defaults(func=cmd_run)
+
+    c = sub.add_parser("check", parents=[common], help="strict sample check of solution.py (or --verify-cmd)")
+    c.add_argument("--verify-cmd", help="run this command as the check instead of the samples (exit 0 = pass)")
+    c.add_argument("--verify-timeout", default="30m")
+    c.set_defaults(func=cmd_check)
+    s = sub.add_parser("status", parents=[common], help="the last run's result")
+    s.set_defaults(func=cmd_status)
+    return ap
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    if getattr(a, "top_p", None) is not None and a.top_p < 0:
+        a.top_p = None
+    if getattr(a, "effort", None) == "":
+        a.effort = None
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

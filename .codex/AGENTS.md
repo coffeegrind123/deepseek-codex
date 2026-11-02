@@ -461,6 +461,7 @@ codex-router     start|stop|restart|status|ensure|logs
 router/          model router (Node, no dependencies) + routes.json
 sandbox/         landlock-exec.py (the cage)
 scripts/         model, balance and hook utilities
+.codex/skills/team-solve/   GVS5H team solver (see "Team solve" below)
 .codex/          CODEX_HOME: config.toml, AGENTS.md (this file), agents/, catalog/, hooks/,
                  skills/, secrets.env (never commit), sessions/, logs
 ```
@@ -721,6 +722,64 @@ level adds a briefing that loses context.
 
 "Avoid scaffolding nobody asked for (multi-agent systems, …)" in the prime directive is
 about what you *build* for the user. It does not restrict how you work.
+
+# Team solve: drive any command-checkable task through the team
+
+The `team-solve` skill (`.codex/skills/team-solve/SKILL.md`, `./codex team-solve`) solves
+one well-specified task with the GVS5H team: a planner, an ideator, a manager that owns
+the task list, workers, and a cut-off summarizer. Every role starts fresh, they share
+only files, and they run for up to 10 rounds. **A check — not a model's claim — decides
+success each round**, and that feedback is what makes the loop beat a single attempt
+(memdoor's 100-problem bench: 47 vs 35). Use it whenever it fits; you do not need the user
+to name it.
+
+The check is the ground truth, and it is either built in or supplied:
+
+- **a contest / algorithmic problem with examples** → the built-in public-sample runner;
+- **any task whose success you can check with a command** → `--verify-cmd "CMD"`: the team
+  iterates until `CMD` (run in the folder) exits 0. Make a test suite pass, make a build
+  compile, satisfy a grader, hit a benchmark threshold, reproduce an output.
+
+**Invoke it when** the task is self-contained and has such a check:
+
+- a competitive-programming problem (AtCoder, Codeforces, LeetCode, ICPC, interview);
+- an algorithm or pure function inside a larger task whose correctness or complexity is
+  the hard part. Extract it, solve it, integrate the result yourself;
+- a self-contained coding task you can hand a command — "make `pytest -q` pass in this
+  package", "get `make` to build this target", "satisfy this grader script";
+- a hard math or multiple-choice question with one final answer
+  (`--spec aime|math500|gpqa|hle`);
+- any time your own attempt fails its check twice.
+
+**Do not invoke it for** open-ended work with no command that decides success (a vague
+refactor, "clean this up", docs, design), or anything needing interactive judgement. No
+check means no ground truth, and the loop degrades to blind model calls.
+
+**How:**
+
+1. Make a fresh folder, e.g. under `.tmp/team-solve/<name>/`, with `task.md` describing the
+   task. For the sample check, add byte-exact `tests/N.in` / `tests/N.out` (and
+   `tests/func_name` for starter code); samples come only from the statement or from
+   outputs you verified yourself, never ones you merely believe. For `--verify-cmd`, make
+   sure the command already exists and runs in the folder.
+2. Run it as a **background** command and wait (do not poll, do not solve it yourself in
+   parallel):
+   - contest: `python3 .codex/skills/team-solve/scripts/team_solve.py run --dir <folder>
+     --keep-best --stress` (add `--samples all` for starter code);
+   - command-checked: add `--verify-cmd "<cmd>"`. Use `--mode agents` when the task spans
+     several files or the workspace — then the roles edit the whole workspace with tools
+     (about 10x the tokens of loop mode, which writes one Python file).
+3. Exit 0 = solved (the check passed); `status --dir <folder>` shows the rounds and
+   verdicts. Exit 1 = the team failed: report it, then try your own approach informed by
+   its `notes.md`. Exit 2 = infrastructure (router, token, a role that could not start):
+   report the message itself.
+4. When you report, say exactly what was verified. With the sample check, passing the
+   samples is not passing hidden tests; with `--verify-cmd`, the result is exactly as
+   strong as that command — state what it checks.
+
+Do not edit the check (`tests/` or the command) to force a pass, and do not present
+hand-edited output as the team's result. If `TEAM_SOLVE_ROLE` is set in your environment,
+you are already a role inside a team run: never invoke team-solve from there.
 
 # Upgrading cxsec-security to a new upstream codex-security
 

@@ -1,0 +1,103 @@
+# Build the patched Codex runtime (scripts/build-codex-local.sh) in CI, so no machine
+# that runs this workspace has to compile it. scripts/fetch-codex-local.sh installs the
+# artifact; build-codex-local.sh then finds the release already built and only verifies
+# and promotes it.
+#
+# Built on Ubuntu 22.04, whose glibc (2.35) is older than the workspace container's
+# Debian 12 (2.36), so the binary runs there; a check fails the build if it ever needs a
+# newer glibc. The runner's preinstalled toolchains are removed and swap is added first:
+# the release build ran out of memory and disk on a stock runner. The artifact is named
+# after the release id, codex-local-<version>-<first 12 of the patch-series sha256>.
+name: Build patched Codex
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "patches/codex/**"
+      - "scripts/build-codex-local.sh"
+      - "package.json"
+      - ".github/workflows/build-codex.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Codex version to build (default: the package.json pin)"
+        required: false
+
+concurrency:
+  group: build-codex-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      # the newest glibc symbol version the binary may need (Debian 12)
+      MAX_GLIBC: "2.36"
+    steps:
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile.build
+          sudo chmod 600 /swapfile.build
+          sudo mkswap /swapfile.build >/dev/null
+          sudo swapon /swapfile.build
+          df -h / /tmp
+          free -h
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          rustup --version
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and release id
+        id: release
+        run: |
+          version="${{ inputs.version }}"
+          [ -n "$version" ] || version="$(node -p "require('./package.json').dependencies['@openai/codex']")"
+          patch_sha="$(bash scripts/build-codex-local.sh --print-patch-sha "$version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "id=$version-${patch_sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Building codex-cli $version with patch series $patch_sha"
+
+      - name: Cache Cargo registry and build target
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/codex-local-cargo-home/registry
+            /tmp/codex-local-cargo-home/git
+            /tmp/codex-local-build-target
+          key: codex-${{ steps.release.outputs.version }}-${{ hashFiles('patches/codex/**') }}
+          restore-keys: |
+            codex-${{ steps.release.outputs.version }}-
+
+      - name: Build
+        run: bash scripts/build-codex-local.sh "${{ steps.release.outputs.version }}"
+
+      - name: Check the release
+        run: |
+          release="tools/codex-local/releases/${{ steps.release.outputs.id }}"
+          test -x "$release/codex"
+          cat "$release/build.json"
+          "$release/codex" --version
+          need="$(objdump -T "$release/codex" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+          echo "highest glibc symbol: $need (allowed: $MAX_GLIBC)"
+          [ "$(printf '%s\n%s\n' "$need" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ] \
+            || { echo "the binary needs glibc $need, newer than $MAX_GLIBC"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-local-${{ steps.release.outputs.id }}
+          path: tools/codex-local/releases/${{ steps.release.outputs.id }}/
+          if-no-files-found: error
+          retention-days: 90

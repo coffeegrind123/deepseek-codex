@@ -120,8 +120,8 @@ if grep -qE '^command = .*verify\.py' "$CONFIG"; then
 else
   ok "verify.py hooks disabled in config.toml (verifier role still spawnable)"
 fi
-node "$ROOT/scripts/check_subagent_hooks.mjs" || die "subagent label hooks are not trusted"
-ok "subagent label hooks trusted"
+node "$ROOT/scripts/check_subagent_hooks.mjs" >/dev/null || die "workspace hooks (.codex/hooks.json) are not trusted"
+ok "workspace hooks trusted (subagent labels, Ovis session report)"
 
 printf '== codex and cs on PATH\n'
 # ~/.local/bin/{codex,cs} -> ./codex and ./cs, so plain `codex` and `cs` work in any folder.
@@ -152,6 +152,12 @@ for skill in "${SKILLS[@]}"; do
     warn "$skill not found under $CLAUDE_SKILLS; set CLAUDE_SKILLS_DIR or drop the skill"
   fi
 done
+
+printf '== skills (in this repo)\n'
+[[ -f "$ROOT/.codex/skills/team-solve/SKILL.md" ]] || die "$ROOT/.codex/skills/team-solve/SKILL.md missing"
+python3 -m py_compile "$ROOT/.codex/skills/team-solve/scripts/team_solve.py" \
+  || die "team-solve runner does not compile"
+ok "team-solve"
 
 printf '== local setup hook\n'
 if [[ -n "${CODEX_LOCAL_SETUP_HOOK:-}" ]]; then
@@ -257,6 +263,15 @@ SL_CACHE="$ROOT/.codex/plugins/cache/workspace/subagent-labels/$SL_VERSION/.code
 grep -q '^\[plugins\."subagent-labels@workspace"\]' "$CONFIG" \
   || die "config.toml does not enable subagent-labels@workspace"
 ok "subagent-labels plugin $SL_VERSION"
+
+printf '== Ovis (web and phone client, README "Ovis")\n'
+# The pinned prebuilt bundle (herdr, bun, the web UI) in tools/ovis, plus herdr's
+# Codex hook generated from it. Nothing is compiled.
+if (( CHECK_ONLY )); then
+  "$ROOT/scripts/ovis.sh" install --check | sed 's/^/  ok   /' || die "Ovis bundle missing; run without --check"
+else
+  "$ROOT/scripts/ovis.sh" install | sed 's/^/  ok   /' || die "Ovis bundle install failed"
+fi
 
 printf '== MCP server launchers (from config.toml)\n'
 for path in /opt/zendriver-mcp/run.py "$HOME/ghidra-in-claude-code/launch_ghidra_mcp.py"; do

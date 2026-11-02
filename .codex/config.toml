@@ -115,6 +115,10 @@ trusted_hash = "sha256:d926e5841eb320e8a277d498cd6b36940ea0bbe13eaf233d825420f82
 [hooks.state."@CODEX_ROOT@/.codex/hooks.json:subagent_start:0:0"]
 trusted_hash = "sha256:0df160ced3ab1001395d71f3ac95a895b81de079258b7951623210853f3fca13"
 
+# Ovis: herdr's Codex session report (scripts/ovis-codex-hook.sh, README "Ovis").
+[hooks.state."@CODEX_ROOT@/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:4f02e6ea7d5c17176bccd3e41c22c4e24b5a30ce8f5b9bd25ab29f0b71f4d9ef"
+
 # End-result verifier hooks: DISABLED. Uncomment the [[hooks...]] tables below to re-enable.
 # End-result verifier hooks (see .codex/hooks/verify.py and README "End-result verifier").
 # Both fire when the agent thinks it is finished. The script spawns a fresh, adversarial

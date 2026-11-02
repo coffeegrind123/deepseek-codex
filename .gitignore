@@ -19,6 +19,8 @@ marketplace/plugins/
 .codex/hooks/__pycache__/
 # Local-only integrations, credentials and state supplied outside this repository.
 .codex/local/
+# Ovis token, server state and pasted files (scripts/ovis.sh).
+.codex/ovis/
 sandbox-test/
 .codex/shell_snapshots/
 .codex/log/

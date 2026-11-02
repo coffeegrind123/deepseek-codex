@@ -78,8 +78,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
  * appear in this file or in logs. `base` is the upstream prefix that replaces
  * Codex's provider base_url (`.../v1`).
  */
-function loadRoutes() {
-  const routesFile = process.env.CODEX_ROUTER_ROUTES ?? path.join(here, 'routes.json');
+export function loadRoutes(routesFile = process.env.CODEX_ROUTER_ROUTES ?? path.join(here, 'routes.json')) {
   const raw = fs.readFileSync(routesFile, 'utf8');
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed.routes) || parsed.routes.length === 0) {
@@ -103,6 +102,7 @@ function loadRoutes() {
       // Optional per-upstream request rewrites, applied to the parsed JSON body.
       drop: Array.isArray(route.dropFields) ? route.dropFields : [],
       set: typeof route.setFields === 'object' && route.setFields !== null ? route.setFields : {},
+      plainTextReasoningHistory: route.plainTextReasoningHistory === true,
       fallbackModel: typeof route.fallbackModel === 'string' && route.fallbackModel.length > 0
         ? route.fallbackModel
         : null,
@@ -225,13 +225,68 @@ function upstreamUrl(base, requestUrl) {
 }
 
 function applyRewrites(route, body) {
-  if (route.drop.length === 0 && Object.keys(route.set).length === 0) {
+  if (
+    route.drop.length === 0
+    && Object.keys(route.set).length === 0
+    && !route.plainTextReasoningHistory
+  ) {
     return null;
   }
   for (const field of route.drop) {
     delete body[field];
   }
   Object.assign(body, route.set);
+  if (route.plainTextReasoningHistory && Array.isArray(body.input)) {
+    // DeepSeek needs the reasoning at the START of a tool-calling assistant turn: before
+    // its assistant message, not merely before the call, and for freeform custom tool
+    // calls (apply_patch) as well (measured 2026-11-01, router.test.mjs). So a turn
+    // without reasoning gets the synthetic item before its first assistant item, when
+    // the turn (up to the next user message or tool output) contains a tool call.
+    const isCall = (it) => it?.type === 'function_call' || it?.type === 'custom_tool_call';
+    const endsTurn = (it) => it?.type === 'user' || it?.role === 'user'
+      || it?.type === 'function_call_output' || it?.type === 'custom_tool_call_output';
+    const turnHasCall = (from) => {
+      for (let j = from; j < body.input.length && !endsTurn(body.input[j]); j += 1) {
+        if (isCall(body.input[j])) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const normalized = [];
+    let reasoningForCurrentResponse = false;
+    for (const [index, item] of body.input.entries()) {
+      const assistantItem = isCall(item) || (item?.type === 'message' && item?.role === 'assistant');
+      if (item?.type === 'reasoning') {
+        reasoningForCurrentResponse = true;
+        delete item.encrypted_content;
+        delete item.internal_chat_message_metadata_passthrough;
+      } else if (endsTurn(item)) {
+        reasoningForCurrentResponse = false;
+      } else if (assistantItem && !reasoningForCurrentResponse && turnHasCall(index)) {
+        normalized.push({
+          type: 'reasoning',
+          id: `router-reasoning-${item.call_id ?? item.id ?? normalized.length}`,
+          summary: [],
+          content: [{
+            type: 'reasoning_text',
+            text: 'The upstream provider returned this tool call without reasoning. Preserve the tool-call sequence for DeepSeek thinking-mode compatibility.',
+          }],
+        });
+        reasoningForCurrentResponse = true;
+      }
+      normalized.push(item);
+    }
+    body.input = normalized;
+  }
+  if (route.plainTextReasoningHistory && Array.isArray(body.include)) {
+    body.include = body.include.filter(
+      (entry) => entry !== 'reasoning.encrypted_content',
+    );
+    if (body.include.length === 0) {
+      delete body.include;
+    }
+  }
   return Buffer.from(JSON.stringify(body));
 }
 
@@ -324,38 +379,13 @@ function validateFallbackGraph(routes) {
     routeNames.add(route.name);
   }
 
-  const visiting = new Set();
-  const visited = new Set();
-  const visitNode = (route, model, pathParts) => {
-    const nodeKey = fallbackNodeKey(route, model);
-    if (visiting.has(nodeKey)) {
-      throw new Error(`fallback cycle: ${[...pathParts, `${route.name}:${model}`].join(' -> ')}`);
-    }
-    if (visited.has(nodeKey)) {
-      return;
-    }
-    visiting.add(nodeKey);
-    if (route.fallbackModel) {
-      const next = selectRoute(routes, route.fallbackModel);
-      if (!next) {
-        throw new Error(`fallbackModel "${route.fallbackModel}" for route "${route.name}" has no matching route`);
-      }
-      visitNode(next, route.fallbackModel, [...pathParts, `${route.name}:${model}`]);
-    }
-    visiting.delete(nodeKey);
-    visited.add(nodeKey);
-  };
-
   for (const route of routes) {
-    if (!route.fallbackModel) {
-      continue;
-    }
-    const next = selectRoute(routes, route.fallbackModel);
-    if (!next) {
+    if (route.fallbackModel && !selectRoute(routes, route.fallbackModel)) {
       throw new Error(`fallbackModel "${route.fallbackModel}" for route "${route.name}" has no matching route`);
     }
-    visitNode(next, route.fallbackModel, []);
   }
+  // Provider fallback graphs may intentionally cycle. The request-local `visited`
+  // set terminates them without rejecting valid bidirectional provider fallbacks.
 }
 
 function findSseBoundary(buffer) {
@@ -808,10 +838,13 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
       upstream.end(activeBody);
     });
 
-    const holdStarted = Date.now();
+    let holdStarted = null;
     for (;;) {
       const outcome = await attemptUpstream();
-      if (outcome.kind === 'policy-failure' && !clientGone) {
+      if (
+        !clientGone
+        && (outcome.kind === 'policy-failure' || outcome.kind === 'usage-limit')
+      ) {
         const fallbackModel = activeRoute.fallbackModel;
         const fallbackRoute = fallbackModel ? selectRoute(routes, fallbackModel) : null;
         const fallbackApiKey = fallbackRoute ? process.env[fallbackRoute.keyEnv] : null;
@@ -834,7 +867,8 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
         if (!blockedReason) {
           logger.line({
             event: 'fallback', model, from: activeRoute.name, to: fallbackRoute.name,
-            fallbackModel, reason: outcome.reason, policyCode: outcome.code,
+            fallbackModel, reason: outcome.reason ?? outcome.kind,
+            policyCode: outcome.code ?? null,
             hop: fallbackHops + 1,
           });
           activeRoute = fallbackRoute;
@@ -849,22 +883,25 @@ export function createRouter({ routes, token, logger, idleMs = DEFAULT_UPSTREAM_
           continue;
         }
 
-        logger.line({
-          event: 'fallback-blocked', model, route: activeRoute.name,
-          reason: blockedReason, policyCode: outcome.code, fallbackModel: fallbackModel ?? null,
-        });
-        deliverCapturedResponse(res, outcome.status, outcome.headers, outcome.body);
-        finish({
-          status: outcome.status,
-          policyCode: outcome.code,
-          fallbackError: blockedReason,
-        });
-        return;
+        if (outcome.kind === 'policy-failure') {
+          logger.line({
+            event: 'fallback-blocked', model, route: activeRoute.name,
+            reason: blockedReason, policyCode: outcome.code, fallbackModel: fallbackModel ?? null,
+          });
+          deliverCapturedResponse(res, outcome.status, outcome.headers, outcome.body);
+          finish({
+            status: outcome.status,
+            policyCode: outcome.code,
+            fallbackError: blockedReason,
+          });
+          return;
+        }
       }
       if (outcome.kind !== 'usage-limit' || clientGone) {
         return;
       }
       const policy = activeRoute.usageLimit;
+      holdStarted ??= Date.now();
       const elapsed = Date.now() - holdStarted;
       const remaining = policy.maxHoldMs - elapsed;
       let waitMs = outcome.resetAt ? outcome.resetAt + policy.resetSlackMs - Date.now() : 0;

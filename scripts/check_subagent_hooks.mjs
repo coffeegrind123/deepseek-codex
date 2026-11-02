@@ -9,7 +9,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX = execFileSync(path.join(ROOT, "scripts/resolve-codex-bin.sh"), [], {
   encoding: "utf8",
 }).trim();
-const REQUIRED_EVENTS = new Set(["preToolUse", "subagentStart"]);
+const REQUIRED_EVENTS = new Set(["preToolUse", "subagentStart", "sessionStart"]);
 const TIMEOUT_MS = 15_000;
 
 function fail(message) {
@@ -53,7 +53,7 @@ function finish(error) {
     fail(error);
     return;
   }
-  process.stdout.write("subagent hook trust: preToolUse and subagentStart trusted\n");
+  process.stdout.write(`hook trust: ${[...REQUIRED_EVENTS].join(", ")} trusted\n`);
 }
 
 function send(message) {

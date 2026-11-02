@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# herdr's shell for every new pane: Codex first, then bash.
+#
+# A new workspace, tab or split opened herdr's default pane, a plain shell, so
+# Ovis showed "Message Shell" or a terminal rather than a Codex chat
+# (2026-11-01). scripts/ovis.sh starts herdr with this script as its SHELL. An
+# interactive pane runs ./codex in the pane's folder; quitting Codex leaves an
+# ordinary bash there.
+#
+# Anything that runs `$SHELL -c ...` (or any other arguments) gets plain bash,
+# and so does a pane that asks for it: OVIS_PANE_PLAIN=1, set by `ovis.sh run`
+# (it types its own launch into the pane) and by Ovis's New workspace / New
+# tab (its agent picker decides; scripts/ovis_patch.py), or OVIS_CODEX_PANE=0.
+
+real_bash="${OVIS_PANE_BASH:-/bin/bash}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Arguments other than a login or interactive flag are a command, not a pane.
+case "${1:-}" in
+  "" | -l | --login | -i) ;;
+  *) exec "$real_bash" "$@" ;;
+esac
+
+# What runs inside the pane (Codex's own tools, an editor's :sh) gets bash.
+export SHELL=/bin/bash
+
+codex_pane() {
+  [[ "${OVIS_PANE_PLAIN:-}" == "1" ]] && return 1
+  local value
+  value="$("$here/../ovis.sh" cfg OVIS_CODEX_PANE 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  [[ ! "$value" =~ ^(0|false|no|off)$ ]]
+}
+
+if codex_pane; then
+  # `codex` on PATH is the shim, which takes itself off PATH and runs ./codex.
+  "$here/codex"
+fi
+exec "$real_bash" -i

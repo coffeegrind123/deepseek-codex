@@ -2,7 +2,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createRouter, parseUsageLimitEvent } from './router.mjs';
+import { createRouter, loadRoutes, parseUsageLimitEvent } from './router.mjs';
 
 const TOKEN = 'test-router-token';
 const listen = (server) => new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -81,7 +81,8 @@ before(async () => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
-      seen.push({ name: 'B', url: req.url, auth: req.headers.authorization, body: JSON.parse(raw) });
+      const requestBody = JSON.parse(raw);
+      seen.push({ name: 'B', url: req.url, auth: req.headers.authorization, body: requestBody });
       if (chunkedContentRiskHitsRemaining > 0) {
         chunkedContentRiskHitsRemaining -= 1;
         const payload = JSON.stringify({
@@ -124,8 +125,18 @@ before(async () => {
         res.end(payload);
         return;
       }
+      if (requestBody.stream === true) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(normalSse);
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ path: req.url, auth: req.headers.authorization }));
+      res.end(JSON.stringify({
+        path: req.url,
+        auth: req.headers.authorization,
+        input: requestBody.input,
+        include: requestBody.include,
+      }));
     });
   });
   const portA = await listen(upstreamA);
@@ -137,15 +148,15 @@ before(async () => {
       drop: ['store'], set: {}, fallbackModel: 'glm-5-turbo',
       usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 10_000, pollMs: 500, heartbeatMs: 100, resetSlackMs: 0, retryBaseMs: 100 } },
     { name: 'zai-turbo', match: 'glm-5-turbo', base: new URL(`http://127.0.0.1:${portA}/api/v1`), keyEnv: 'KEY_A',
-      drop: ['top_p'], set: { temperature: 0.2 },
+      drop: ['top_p'], set: { temperature: 0.2 }, fallbackModel: 'deepseek-flash',
       usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 10_000, pollMs: 500, heartbeatMs: 100, resetSlackMs: 0, retryBaseMs: 100 } },
     { name: 'zai-5.3', match: 'glm-5.3', base: new URL(`http://127.0.0.1:${portA}/api/v1`), keyEnv: 'KEY_A',
       drop: [], set: {}, fallbackModel: 'glm-5.3-flash',
       usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 10_000, pollMs: 500, heartbeatMs: 100, resetSlackMs: 0, retryBaseMs: 100 } },
     { name: 'zai-other', match: 'glm-', base: new URL(`http://127.0.0.1:${portA}/api/v1`), keyEnv: 'KEY_A',
-      drop: [], set: {}, fallbackModel: 'glm-5-turbo',
+      drop: [], set: {}, fallbackModel: 'deepseek-flash',
       usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 10_000, pollMs: 500, heartbeatMs: 100, resetSlackMs: 0, retryBaseMs: 100 } },
-    { name: 'b', match: 'deepseek-', base: new URL(`http://127.0.0.1:${portB}`), keyEnv: 'KEY_B', drop: ['store'], set: {}, fallbackModel: 'glm-5.3',
+    { name: 'b', match: 'deepseek-', base: new URL(`http://127.0.0.1:${portB}`), keyEnv: 'KEY_B', drop: ['store'], set: {}, fallbackModel: 'glm-5.3', plainTextReasoningHistory: true,
       usageLimit: { enabled: false } },
   ];
   router = createRouter({ routes, token: TOKEN, logger: { line() {} }, idleMs: 5000 });
@@ -163,6 +174,131 @@ test('routes by model prefix, strips /v1, swaps the bearer token', async () => {
   const last = seen.at(-1);
   assert.equal(last.name, 'B');
   assert.equal('store' in last.body, false, 'dropFields rewrite applied');
+});
+
+test('DeepSeek reasoning history is normalized to plain text', async () => {
+  const res = await request(routerPort, {
+    body: {
+      model: 'deepseek-flash',
+      input: [
+        { type: 'reasoning', id: 'native-deepseek', summary: [], content: [
+          { type: 'reasoning_text', text: 'prior reasoning' },
+        ], encrypted_content: 'native-deepseek-0' },
+        { type: 'reasoning', id: 'glm-fallback', summary: [], content: [
+          { type: 'reasoning_text', text: 'fallback reasoning' },
+        ], encrypted_content: null },
+      ],
+      include: ['reasoning.encrypted_content'],
+    },
+  });
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.text);
+  assert.equal(echoed.include, undefined);
+  assert.deepEqual(echoed.input, [
+    { type: 'reasoning', id: 'native-deepseek', summary: [], content: [
+      { type: 'reasoning_text', text: 'prior reasoning' },
+    ] },
+    { type: 'reasoning', id: 'glm-fallback', summary: [], content: [
+      { type: 'reasoning_text', text: 'fallback reasoning' },
+    ] },
+  ]);
+});
+
+test('DeepSeek gets compatibility reasoning for orphaned fallback tool calls', async () => {
+  const res = await request(routerPort, {
+    body: {
+      model: 'deepseek-flash',
+      input: [
+        { role: 'user', content: 'work' },
+        { type: 'reasoning', id: 'valid', summary: [], content: [
+          { type: 'reasoning_text', text: 'valid reasoning' },
+        ], encrypted_content: null },
+        { type: 'function_call', id: 'valid-call', call_id: 'call_valid', name: 'tool', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_valid', output: 'ok' },
+        { type: 'function_call', id: 'orphan-call', call_id: 'call_orphan', name: 'tool', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_orphan', output: 'ok' },
+      ],
+    },
+  });
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.text);
+  assert.deepEqual(echoed.input.map((item) => [item.type, item.id ?? item.call_id]), [
+    [undefined, undefined],
+    ['reasoning', 'valid'],
+    ['function_call', 'valid-call'],
+    ['function_call_output', 'call_valid'],
+    ['reasoning', 'router-reasoning-call_orphan'],
+    ['function_call', 'orphan-call'],
+    ['function_call_output', 'call_orphan'],
+  ]);
+  const injected = echoed.input.find((item) => item.id === 'router-reasoning-call_orphan');
+  assert.deepEqual(injected.content, [{
+    type: 'reasoning_text',
+    text: 'The upstream provider returned this tool call without reasoning. Preserve the tool-call sequence for DeepSeek thinking-mode compatibility.',
+  }]);
+});
+
+// DeepSeek rejects (HTTP 400 "The `reasoning_text` in the thinking mode must be passed back
+// to the API") a tool-calling assistant turn whose reasoning comes after its assistant
+// message, and one whose tool call is a freeform custom_tool_call (apply_patch). Measured
+// against api.deepseek.com on 2026-11-01: [user, reasoning, message, call] -> 200;
+// [user, message, reasoning, call] -> 400; [user, custom_tool_call] -> 400.
+test('compatibility reasoning goes before the assistant message of a tool-calling turn', async () => {
+  const res = await request(routerPort, {
+    body: {
+      model: 'deepseek-flash',
+      input: [
+        { role: 'user', content: 'work' },
+        { type: 'message', role: 'assistant', id: 'say', content: [{ type: 'output_text', text: 'Reading.' }] },
+        { type: 'function_call', id: 'c1', call_id: 'call_1', name: 'tool', arguments: '{}' },
+        { type: 'function_call', id: 'c2', call_id: 'call_2', name: 'tool', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+        { type: 'function_call_output', call_id: 'call_2', output: 'ok' },
+        { type: 'message', role: 'assistant', id: 'final', content: [{ type: 'output_text', text: 'Done.' }] },
+      ],
+    },
+  });
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.text);
+  assert.deepEqual(echoed.input.map((item) => [item.type, item.id ?? item.call_id]), [
+    [undefined, undefined],
+    ['reasoning', 'router-reasoning-say'],
+    ['message', 'say'],
+    ['function_call', 'c1'],
+    ['function_call', 'c2'],
+    ['function_call_output', 'call_1'],
+    ['function_call_output', 'call_2'],
+    ['message', 'final'],
+  ]);
+});
+
+test('custom tool calls get compatibility reasoning too', async () => {
+  const res = await request(routerPort, {
+    body: {
+      model: 'deepseek-flash',
+      input: [
+        { role: 'user', content: 'patch it' },
+        { type: 'custom_tool_call', id: 'p1', call_id: 'call_p', name: 'apply_patch', input: '*** Begin Patch\n*** End Patch' },
+        { type: 'custom_tool_call_output', call_id: 'call_p', output: 'ok' },
+        { type: 'reasoning', id: 'r2', summary: [], content: [{ type: 'reasoning_text', text: 'next' }] },
+        { type: 'message', role: 'assistant', id: 'm2', content: [{ type: 'output_text', text: 'More.' }] },
+        { type: 'custom_tool_call', id: 'p2', call_id: 'call_p2', name: 'apply_patch', input: '*** Begin Patch\n*** End Patch' },
+        { type: 'custom_tool_call_output', call_id: 'call_p2', output: 'ok' },
+      ],
+    },
+  });
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.text);
+  assert.deepEqual(echoed.input.map((item) => [item.type, item.id ?? item.call_id]), [
+    [undefined, undefined],
+    ['reasoning', 'router-reasoning-call_p'],
+    ['custom_tool_call', 'p1'],
+    ['custom_tool_call_output', 'call_p'],
+    ['reasoning', 'r2'],
+    ['message', 'm2'],
+    ['custom_tool_call', 'p2'],
+    ['custom_tool_call_output', 'call_p2'],
+  ]);
 });
 
 test('prefixes the upstream base path', async () => {
@@ -242,7 +378,7 @@ test('keeps sniffing through output_item/content_part additions before cyber_pol
   assert.match(res.text, /response\.completed/);
   assert.equal(seen.length - before, 2);
   assert.equal(seen.at(-2).body.model, 'glm-after-item');
-  assert.equal(seen.at(-1).body.model, 'glm-5-turbo');
+  assert.equal(seen.at(-1).body.model, 'deepseek-flash');
   assert.doesNotMatch(res.text, /cyber_policy/);
 });
 
@@ -301,7 +437,120 @@ test('falls back on explicit Content Exists Risk text in an SSE error', async ()
   });
   assert.equal(res.status, 200);
   assert.match(res.text, /response\.completed/);
-  assert.equal(seen.at(-1).body.model, 'glm-5-turbo');
+  assert.equal(seen.at(-1).body.model, 'deepseek-flash');
+});
+
+test('content risk falls back past a usage-limited glm-5.3', async () => {
+  contentRiskHitsRemaining = 1;
+  limitHitsRemaining = 1;
+  limitResetAt = Date.now() + 600;
+  const before = seen.length;
+  const res = await request(routerPort, {
+    body: { model: 'deepseek-flash', input: 'authorized research', stream: true },
+  });
+  assert.equal(res.status, 200);
+  assert.doesNotMatch(res.text, /router\.hold/);
+  assert.match(res.text, /response\.completed/);
+  assert.deepEqual(
+    seen.slice(before).map((entry) => entry.body.model),
+    ['deepseek-flash', 'glm-5.3', 'glm-5.3-flash'],
+  );
+});
+
+test('usage limits walk the complete GLM fallback chain', async () => {
+  limitHitsRemaining = 2;
+  limitResetAt = Date.now() + 600;
+  const before = seen.length;
+  const res = await request(routerPort, {
+    body: { model: 'glm-5.3', input: 'authorized research', stream: true },
+  });
+  assert.equal(res.status, 200);
+  assert.doesNotMatch(res.text, /router\.hold/);
+  assert.match(res.text, /response\.completed/);
+  assert.deepEqual(
+    seen.slice(before).map((entry) => entry.body.model),
+    ['glm-5.3', 'glm-5.3-flash', 'glm-5-turbo'],
+  );
+});
+
+test('exhausted GLM usage limits continue to DeepSeek', async () => {
+  limitHitsRemaining = 3;
+  limitResetAt = Date.now() + 600;
+  const before = seen.length;
+  try {
+    const res = await request(routerPort, {
+      body: { model: 'glm-5.3', input: 'authorized research', stream: true },
+    });
+    assert.equal(res.status, 200);
+    assert.doesNotMatch(res.text, /router\.hold/);
+    assert.match(res.text, /response\.completed/);
+    assert.deepEqual(
+      seen.slice(before).map((entry) => entry.body.model),
+      ['glm-5.3', 'glm-5.3-flash', 'glm-5-turbo', 'deepseek-flash'],
+    );
+    assert.equal(seen.at(-1).name, 'B');
+  } finally {
+    limitHitsRemaining = 0;
+  }
+});
+
+test('a request that started on DeepSeek does not retry it after GLM exhaustion', async () => {
+  const routes = [
+    {
+      name: 'loop-deepseek', match: 'loop-deepseek-', base: new URL(`http://127.0.0.1:${upstreamB.address().port}`),
+      keyEnv: 'KEY_B', drop: [], set: {}, fallbackModel: 'loop-glm', usageLimit: { enabled: false },
+    },
+    {
+      name: 'loop-glm', match: 'loop-glm', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {}, fallbackModel: 'loop-deepseek-flash',
+      usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 0 },
+    },
+  ];
+  const localRouter = createRouter({ routes, token: TOKEN, logger: { line() {} }, idleMs: 5000 });
+  const localPort = await listen(localRouter);
+  contentRiskHitsRemaining = 1;
+  limitHitsRemaining = 1;
+  limitResetAt = Date.now() + 60_000;
+  const before = seen.length;
+  try {
+    const res = await request(localPort, {
+      body: { model: 'loop-deepseek-flash', input: 'authorized research', stream: true },
+    });
+    assert.equal(res.status, 200);
+    assert.doesNotMatch(res.text, /router\.hold/);
+    assert.doesNotMatch(res.text, /response\.completed/);
+    assert.match(res.text, /rate_limit_exceeded/);
+    assert.deepEqual(
+      seen.slice(before).map((entry) => entry.body.model),
+      ['loop-deepseek-flash', 'loop-glm'],
+    );
+    assert.equal(
+      seen.slice(before).filter((entry) => entry.name === 'B').length,
+      1,
+      'DeepSeek was attempted only once',
+    );
+  } finally {
+    contentRiskHitsRemaining = 0;
+    limitHitsRemaining = 0;
+    await close(localRouter);
+  }
+});
+
+test('hold occurs only after every usage-limited fallback is exhausted', async () => {
+  contentRiskHitsRemaining = 1;
+  limitHitsRemaining = 3;
+  limitResetAt = Date.now() + 600;
+  const before = seen.length;
+  const res = await request(routerPort, {
+    body: { model: 'deepseek-flash', input: 'authorized research', stream: true },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.text, /event: router\.hold/);
+  assert.match(res.text, /response\.completed/);
+  assert.deepEqual(
+    seen.slice(before).map((entry) => entry.body.model),
+    ['deepseek-flash', 'glm-5.3', 'glm-5.3-flash', 'glm-5-turbo', 'glm-5-turbo'],
+  );
 });
 
 test('passes ordinary SSE through byte-for-byte', async () => {
@@ -348,22 +597,50 @@ test('passes a policy SSE through unchanged when fallback cannot start', async (
   }
 });
 
-test('rejects a route+model fallback cycle at construction', () => {
+test('accepts intentional fallback cycles and stops when a request revisits a node', async () => {
   const base = new URL('http://127.0.0.1:1');
   const routes = [
     {
-      name: 'cycle-a', match: 'cycle-a-', base, keyEnv: 'KEY_A', drop: [], set: {},
+      name: 'cycle-a', match: 'cycle-a-', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {},
       fallbackModel: 'cycle-b-1', usageLimit: { enabled: false },
     },
     {
-      name: 'cycle-b', match: 'cycle-b-', base, keyEnv: 'KEY_A', drop: [], set: {},
+      name: 'cycle-b', match: 'cycle-b-', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {},
       fallbackModel: 'cycle-a-1', usageLimit: { enabled: false },
     },
   ];
-  assert.throws(
-    () => createRouter({ routes, token: TOKEN, logger: { line() {} } }),
-    /fallback cycle: .*cycle-[ab]:cycle-[ab]-1/,
-  );
+  const payload = {
+    response: { error: { code: 'cyber_policy', message: 'blocked' }, status: 'failed' },
+    type: 'response.failed',
+  };
+  ssePolicyHits.set('cycle-a-1', { remaining: 1, payload });
+  ssePolicyHits.set('cycle-b-1', { remaining: 1, payload });
+  const localRouter = createRouter({ routes, token: TOKEN, logger: { line() {} } });
+  const localPort = await listen(localRouter);
+  const before = seen.length;
+  try {
+    const res = await request(localPort, {
+      body: { model: 'cycle-a-1', input: 'authorized research', stream: true },
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(
+      seen.slice(before).map((entry) => entry.body.model),
+      ['cycle-a-1', 'cycle-b-1'],
+      'the visited route+model node prevented the third attempt',
+    );
+    assert.match(res.text, /cyber_policy/);
+  } finally {
+    ssePolicyHits.delete('cycle-a-1');
+    ssePolicyHits.delete('cycle-b-1');
+    await close(localRouter);
+  }
+});
+
+test('production routes permit the bidirectional provider fallback graph', () => {
+  const routes = loadRoutes(new URL('./routes.json', import.meta.url).pathname);
+  assert.doesNotThrow(() => createRouter({ routes, token: TOKEN, logger: { line() {} } }));
 });
 
 test('passes non-risk 400 responses through without falling back', async () => {
@@ -430,23 +707,84 @@ test('parseUsageLimitEvent reads z.ai reset times as UTC+8', () => {
 });
 
 test('a usage-limit failure is held with heartbeats and retried after the reset time', async () => {
+  const localRouter = createRouter({
+    routes: [{
+      name: 'hold-terminal', match: 'hold-', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {},
+      usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 10_000, pollMs: 500,
+        heartbeatMs: 100, resetSlackMs: 0, retryBaseMs: 100 },
+    }],
+    token: TOKEN,
+    logger: { line() {} },
+    idleMs: 5000,
+  });
+  const localPort = await listen(localRouter);
   limitHitsRemaining = 2;
   limitResetAt = Date.now() + 600;
   const before = seen.length;
-  const res = await request(routerPort, { body: { model: 'glm-5.3', input: 'x', stream: true } });
-  assert.equal(res.status, 200);
-  assert.match(res.headers['content-type'], /text\/event-stream/);
-  assert.match(res.text, /^event: router\.hold\ndata: \{"type":"router\.hold"/m, 'heartbeat events were sent while holding');
-  assert.match(res.text, /response\.completed/, 'real stream delivered after the hold');
-  assert.doesNotMatch(res.text, /rate_limit_exceeded/, 'the failure never reached the client');
-  assert.equal(seen.length - before, 3, 'two limited attempts plus the successful one');
+  try {
+    const res = await request(localPort, { body: { model: 'hold-model', input: 'x', stream: true } });
+    assert.equal(res.status, 200);
+    assert.match(res.headers['content-type'], /text\/event-stream/);
+    assert.match(res.text, /^event: router\.hold\ndata: \{"type":"router\.hold"/m, 'heartbeat events were sent while holding');
+    assert.match(res.text, /response\.completed/, 'real stream delivered after the hold');
+    assert.doesNotMatch(res.text, /rate_limit_exceeded/, 'the failure never reached the client');
+    assert.equal(seen.length - before, 3, 'two limited attempts plus the successful one');
+  } finally {
+    limitHitsRemaining = 0;
+    await close(localRouter);
+  }
+});
+
+test('a terminal usage limit fails immediately when holding is disabled', async () => {
+  const localRouter = createRouter({
+    routes: [{
+      name: 'fail-fast', match: 'fail-fast-', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {},
+      usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 0, pollMs: 100,
+        heartbeatMs: 50, resetSlackMs: 0, retryBaseMs: 50 },
+    }],
+    token: TOKEN,
+    logger: { line() {} },
+    idleMs: 5000,
+  });
+  const localPort = await listen(localRouter);
+  limitHitsRemaining = 1;
+  limitResetAt = Date.now() + 60_000;
+  try {
+    const res = await request(localPort, {
+      body: { model: 'fail-fast-model', input: 'x', stream: true },
+    });
+    assert.equal(res.status, 200);
+    assert.doesNotMatch(res.text, /router\.hold/);
+    assert.match(res.text, /event: error\ndata: .*rate_limit_exceeded/);
+  } finally {
+    limitHitsRemaining = 0;
+    await close(localRouter);
+  }
 });
 
 test('a usage limit that never clears is reported after maxHoldMs', async () => {
+  const localRouter = createRouter({
+    routes: [{
+      name: 'never-clears', match: 'never-clears-', base: new URL(`http://127.0.0.1:${upstreamA.address().port}/api/v1`),
+      keyEnv: 'KEY_A', drop: [], set: {},
+      usageLimit: { enabled: true, resetTzOffsetMinutes: 480, maxHoldMs: 100, pollMs: 20,
+        heartbeatMs: 10, resetSlackMs: 0, retryBaseMs: 20 },
+    }],
+    token: TOKEN,
+    logger: { line() {} },
+    idleMs: 5000,
+  });
+  const localPort = await listen(localRouter);
   limitHitsRemaining = 1000;
   limitResetAt = Date.now() - 1000; // stale reset time -> poll cadence
-  const res = await request(routerPort, { body: { model: 'glm-5.3', input: 'x', stream: true } });
-  limitHitsRemaining = 0;
-  assert.equal(res.status, 200);
-  assert.match(res.text, /event: error\ndata: .*rate_limit_exceeded/);
+  try {
+    const res = await request(localPort, { body: { model: 'never-clears-model', input: 'x', stream: true } });
+    assert.equal(res.status, 200);
+    assert.match(res.text, /event: error\ndata: .*rate_limit_exceeded/);
+  } finally {
+    limitHitsRemaining = 0;
+    await close(localRouter);
+  }
 });

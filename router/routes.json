@@ -5,6 +5,7 @@
       "match": "deepseek-",
       "base": "https://api.deepseek.com",
       "keyEnv": "DEEPSEEK_API_KEY",
+      "plainTextReasoningHistory": true,
       "fallbackModel": "glm-5.3"
     },
     {
@@ -13,14 +14,15 @@
       "base": "https://api.z.ai/api/v1",
       "keyEnv": "ZAI_API_KEY",
       "fallbackModel": "glm-5-turbo",
-      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 0 }
     },
     {
       "name": "zai-turbo",
       "match": "glm-5-turbo",
       "base": "https://api.z.ai/api/v1",
       "keyEnv": "ZAI_API_KEY",
-      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+      "fallbackModel": "deepseek-flash",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 0 }
     },
     {
       "name": "zai-5.3",
@@ -28,14 +30,15 @@
       "base": "https://api.z.ai/api/v1",
       "keyEnv": "ZAI_API_KEY",
       "fallbackModel": "glm-5.3-flash",
-      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 0 }
     },
     {
       "name": "zai",
       "match": "glm-",
       "base": "https://api.z.ai/api/v1",
       "keyEnv": "ZAI_API_KEY",
-      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 21600000 }
+      "fallbackModel": "deepseek-flash",
+      "usageLimit": { "enabled": true, "resetTzOffsetMinutes": 480, "maxHoldMs": 0 }
     }
   ]
 }

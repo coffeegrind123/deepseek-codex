@@ -180,6 +180,23 @@ LOCK_FILE="/tmp/codex-local-build-$(printf '%s' "$ROOT" | sha256sum | cut -c1-12
 exec 9>"$LOCK_FILE"
 flock -n 9 || die "another local Codex build is already running"
 
+# A machine that must not compile (CODEX_LOCAL_BUILD=ci, or "ci" in tools/codex-local/build-mode)
+# takes the CI build of this exact release instead: scripts/fetch-codex-local.sh downloads it
+# into its release folder and calls this script again, which then only verifies and promotes it.
+BUILD_MODE="${CODEX_LOCAL_BUILD:-$(cat "$LOCAL_ROOT/build-mode" 2>/dev/null || true)}"
+BUILD_MODE="${BUILD_MODE//[[:space:]]/}"
+case "$BUILD_MODE" in
+  ""|local) ;;
+  ci)
+    EARLY_RELEASE_DIR="$RELEASES_DIR/$TARGET-$(patch_sha_for "$TARGET" | cut -c1-12)"
+    if [[ ! -e "$EARLY_RELEASE_DIR" ]]; then
+      exec 9>&-
+      exec "$ROOT/scripts/fetch-codex-local.sh" "$TARGET"
+    fi
+    ;;
+  *) die "unknown build mode '$BUILD_MODE' (CODEX_LOCAL_BUILD or tools/codex-local/build-mode): local or ci" ;;
+esac
+
 if [[ -e "$SOURCE_DIR" || -L "$SOURCE_DIR" ]]; then
   [[ -d "$SOURCE_DIR" && ! -L "$SOURCE_DIR" ]] \
     || die "source cache is not a directory: $SOURCE_DIR"
@@ -210,7 +227,9 @@ PATCH_SHA="$(patch_sha_for "$TARGET")"
 PATCH_ID="${PATCH_SHA:0:12}"
 RELEASE_ID="$TARGET-$PATCH_ID"
 RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
-TRIPLE="$(rustc -vV | awk '$1 == "host:" { print $2; exit }')"
+# awk reads all of rustc's output: exiting at the match would SIGPIPE rustc, which pipefail
+# turns into a failed build (exit 141 on a CI runner).
+TRIPLE="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
 [[ -n "$TRIPLE" ]] || die "rustc did not report a host triple"
 
 mkdir -p "$RELEASES_DIR" "$STAGING_DIR" "$CARGO_HOME_DIR"

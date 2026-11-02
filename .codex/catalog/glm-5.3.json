@@ -35,6 +35,7 @@
   "context_window": 1048576,
   "max_context_window": 1048576,
   "effective_context_window_percent": 95,
+  "auto_compact_token_limit": 330000,
   "supports_parallel_tool_calls": true,
   "experimental_supported_tools": [],
   "input_modalities": [

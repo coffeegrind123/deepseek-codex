@@ -1,0 +1,34 @@
+team-solve
+
+The loop mode's role prompts, reply parsing and control flow are taken from GVS5H
+(https://github.com/slee-persis/GVS5H, codebase/v2-current/escalation/multiagent.py and
+orchestrator.py at commit b4cc2f734a28fdab6c37af48e612c4d9e40a7a20):
+
+    MIT License
+    Copyright (c) 2026 Persis Capital Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this
+    software and associated documentation files (the "Software"), to deal in the Software
+    without restriction, including without limitation the rights to use, copy, modify,
+    merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to the following
+    conditions:
+
+    The above copyright notice and this permission notice shall be included in all copies
+    or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+    INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+    PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+    HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+    CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+    THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The agent mode's step prompts, the sample-checker semantics, the sample problem
+(sample/) and the parity-test scenarios in tests/test_team_solve.py are adapted from
+Memdoor (https://github.com/guregodevo/memdoor, examples/workflows/team-solve at commit
+4b7ca6e239cbc777fe8135410cd6771414242713), licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Changes: the prompts' memdoor paths and run
+identifier template were replaced with this skill's checker and run id; the workflow
+engine was replaced by teamsolve/agents.py; the checker was ported from bash to Python
+and extended to functional (starter-code) samples.

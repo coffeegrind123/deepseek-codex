@@ -1,5 +1,5 @@
 {
-  "description": "Show a human-readable subagent task label when a child starts.",
+  "description": "Show a human-readable subagent task label when a child starts; tell herdr which Codex session runs in its pane (Ovis).",
   "hooks": {
     "PreToolUse": [
       {
@@ -22,6 +22,17 @@
             "command": "node \"$CODEX_HOME/../plugins/subagent-labels/scripts/subagent-start.mjs\"",
             "timeout": 5,
             "statusMessage": "Naming subagent"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CODEX_HOME/../scripts/ovis-codex-hook.sh\" session",
+            "timeout": 10
           }
         ]
       }

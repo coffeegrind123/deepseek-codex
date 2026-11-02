@@ -10,7 +10,9 @@ git clone git@github.com:coffeegrind123/deepseek-codex.git codex && cd codex
 ./codex exec 'prompt' </dev/null   non-interactive; close stdin or exec waits for piped input
 ./codex-router status|logs   the model router
 npm test                     router unit tests
+./codex team-solve run --dir D  GVS5H team solver on D/task.md + D/tests/ (README "Team solve")
 npm run models               regenerate .codex/models.json from .codex/catalog/
+./codex ovis status|token|run   Ovis: Codex sessions in a browser or phone (README "Ovis")
 ```
 
 ## Day-to-day use
@@ -56,6 +58,16 @@ Patch filenames select their target: `codex-<version>-<name>.patch` applies only
 updater also compares the recorded patch-series hash, so editing a patch rebuilds the
 same Codex version instead of reusing a stale runtime.
 
+**Building in CI instead of here.** `.github/workflows/build-codex.yml` runs
+`scripts/build-codex-local.sh` on Ubuntu 22.04 (glibc 2.35, older than this container's
+Debian 12, and the build fails if the binary needs a newer glibc) on every push that changes `patches/codex/`, the build script or the version
+pin, and on demand (`gh workflow run build-codex.yml -f version=X.Y.Z`). It uploads the
+release as the artifact `codex-local-<version>-<patch id>`. `scripts/fetch-codex-local.sh
+[VERSION]` downloads the artifact for this checkout's exact patch series and lets the build
+script verify and promote it. On a machine that must not compile, `CODEX_LOCAL_BUILD=ci` or
+the word `ci` in `tools/codex-local/build-mode` makes the build script, and so `setup.sh` and
+`./codex update`, fetch the CI build instead of running cargo.
+
 This build is intentional. Stock Codex accepts only fixed identifiers in
 [`tui.status_line`](https://developers.openai.com/codex/config-reference/), and the
 official Linux payload is a stripped static-PIE executable. A byte-diff from the stock
@@ -86,7 +98,7 @@ are handled, and failures replace the value with `DeepSeek unavailable` while a 
 successful value is marked stale. Cache entries older than five minutes are also stale.
 The wrapper retains the terminal-title balance indicator by default; set
 `CODEX_DEEPSEEK_BALANCE_TITLE=off` to disable only the title while keeping the footer cache
-fresh.
+fresh. Inside herdr panes it does the same, since herdr names a pane after its title.
 
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with `CODEX_HOME` here and cwd in the folder you ran it from (or `-C DIR`),
@@ -151,12 +163,21 @@ needs you. Cap budgets with `goals.max_goal_token_budget` in `config.toml`.
 
 #### Usage-limit hold (GLM only)
 
-The router can swallow an upstream's "usage limit reached" SSE failure, keep Codex's
-stream alive with `router.hold` heartbeats, and re-send the request once the window
-resets, so a goal never parks as `UsageLimited`. It is on for the `zai` route (z.ai's
-5-hour GLM window) and off for DeepSeek, which is pay-as-you-go. A route opts in with
+The router first walks the configured fallback chain when an upstream reports a usage
+limit. If the terminal route is still limited, it can either fail immediately
+(`maxHoldMs: 0`) or keep Codex's stream alive with `router.hold` heartbeats and retry
+after the window resets. This workspace fails fast because all z.ai GLM models share
+the same five-hour account quota. A route opts in with
 `"usageLimit": { "enabled": true, ... }` in `routes.json` (see `router/router.mjs`,
 `DEFAULT_USAGE_LIMIT`; covered by `npm test`).
+
+#### State-aware fallback
+
+The GLM fallback chain is `glm-5.3 -> glm-5.3-flash -> glm-5-turbo -> deepseek-flash`,
+and DeepSeek requests can also fall back into GLM. `routes.json` may therefore contain
+fallback cycles: each request tracks its visited route+model nodes at runtime and refuses
+to revisit one. A request already attempted on DeepSeek will not retry it after GLM
+exhaustion.
 
 ### Subagents
 
@@ -340,6 +361,167 @@ plugin, pulls the `cs` image and links `~/.local/bin/cs`. To upgrade, bump the p
 version and the matching image digest in `./cs` (`docker buildx imagetools inspect
 ghcr.io/openai/codex-security:<ver>`), then re-run `./setup.sh`. Cloud, Linear and other connected apps need a ChatGPT account and stay off.
 
+### Team solve (GVS5H)
+
+`.codex/skills/team-solve/` runs the GVS5H method (Lee, 2026: five Qwen3.8-27B roles matched
+Fable 5 on LiveCodeBench Hard) on this workspace's models. A planner, an ideator, a manager
+that owns the task list, workers and a cut-off summarizer each start from a fresh context
+and share only files (`plan.md`, `notes.md`, `tasks.json`, …), for up to 10 rounds. A
+**check, not a model, decides success each round** — that feedback is what makes the loop
+beat a single call. The check is either the built-in public-sample runner (contest
+problems) or a command you supply (`--verify-cmd`): make a test suite pass, make a build
+compile, satisfy a grader, hit a benchmark, reproduce an output — exit 0 means solved. Port
+of memdoor's `examples/workflows/team-solve`; provenance and licences in the skill's `NOTICE`.
+
+```sh
+./codex team-solve run --dir my-task                             # contest: task.md + tests/N.in/N.out
+./codex team-solve run --dir my-task --keep-best --stress        # contest, both guards
+./codex team-solve run --dir my-task --verify-cmd "pytest -q"    # generic: loop writes one Python file
+./codex team-solve run --dir my-task --verify-cmd "make" --mode agents  # generic: agents edit the workspace
+./codex team-solve status --dir my-task                          # rounds, verdicts, tokens
+./codex team-solve check  --dir my-task [--verify-cmd "CMD"]     # the strict check on its own
+```
+
+Inside a Codex session the orchestrator uses it as the `$team-solve` skill. Exit 0 means
+solved (the check passed), 1 means not solved, 2 means infrastructure failure.
+
+- **The check is the ground truth.** Without `--verify-cmd` it is the public-sample runner
+  (contest problems, `tests/N.in`/`N.out`). With `--verify-cmd "CMD"` the team iterates
+  until `CMD`, run in the folder, exits 0, and the command's output is the manager's
+  feedback each round; `--verify-cmd` implies the neutral `generic` solver spec.
+- **`--mode loop` (default)** is the authors' loop, one tool-less model call per role, sent
+  straight to the router's `/v1/responses` (streamed, because the router cuts an upstream
+  silent for 600 s). Authors' temperatures (0.2–0.4), top_p 0.95, 128K reply cap. The
+  artifact is one file (`solution.py`, or `--solution-file`), so loop + `--verify-cmd` is
+  "write one Python file that passes this check". `tests/test_team_solve.py` runs the
+  authors' own `multiagent.py` (fetched at a pinned commit by `tests/fetch_gvs5h.sh`) and
+  this port against one scripted model, and requires every request to be byte-identical
+  across four scenarios.
+- **`--mode agents`** runs memdoor's eight steps: plan → ideate-a ∥ ideate-b → solve →
+  test → review → repair → verify. Each role is `codex -a never exec --disable multi_agent`
+  in the folder, editing the whole workspace; test and verify run the check. With
+  `--verify-cmd` the roles are told to edit whatever files the task needs — this is the
+  general, whole-workspace path. A role costs a full agent turn.
+- **Guards (sample mode), off by default so the default stays the authors' method.** Both
+  close gaps that cost memdoor points in its 5-pass run. `--keep-best` restores the last
+  passing program when the final one fails (works with `--verify-cmd` too). `--stress` has
+  a fresh call write `brute.py` and `gen.py`, checks them against the samples, then compares
+  every passing program with the brute force on 200 random small inputs; a mismatch
+  overrides the manager's "done".
+- **Resume by replay.** Rerunning the same command replays every recorded call whose
+  request is byte-identical (`.team-solve/calls/`), continuing live from the first that
+  differs, so an interrupted run costs nothing to finish. `--fresh` starts an independent
+  attempt.
+- Also supported: `--samples all` (LeetCode-style `tests/func_name` samples inside the
+  loop), `--spec aime|math500|gpqa|hle` (the authors' math/QA prompts, result in
+  `answer.md`), `--model` for any routed model.
+
+Measured 2026-11-01 on deepseek-flash:
+- contest sample (balanced substrings, N ≤ 200000), loop mode `--keep-best --stress`:
+  solved in 91 s and 6 calls, 4.7K in / 6.1K out tokens, brute force agreed 200/200. Agents
+  mode on the same problem: 611 s, 1.11M in (1.08M cached) / 30K out — about 100x the loop
+  input volume.
+- `--verify-cmd` loop mode (a Fibonacci task checked by a `check.py` script): solved in
+  23 s and 5 calls, 3.6K in / 2.8K out tokens.
+
+### Ovis (web and phone client)
+
+[Ovis](https://github.com/devswha/ovis) shows the Codex sessions running in
+[herdr](https://github.com/herdrdev/herdr) panes as chats in a browser or on a phone:
+answer approvals and questions, send messages, follow the plan, open the live terminal.
+
+```sh
+./codex ovis status              # server, herdr, gate, access
+./codex ovis token               # the access token (generated once, .codex/ovis/token, 0600)
+./codex ovis run [-w DIR] [-- <codex args>]   # Codex in a new herdr pane, attached here
+./codex ovis start | stop        # stop leaves herdr and its panes running
+./codex ovis gate ensure | status | rm        # the host-side port (below)
+./codex ovis install [--check]   # the pinned bundle; setup.sh runs it
+```
+
+Open **http://127.0.0.1:7327/** on the Docker host (with Docker Desktop, the Windows host) and
+sign in with the token.
+
+- **Always on.** Every interactive `./codex` starts it in the background (detached, so
+  the TUI never waits). `exec` runs, other unattended launches, shells inside the
+  cage and herdr panes don't start it. `OVIS_ENABLED=0` turns it off.
+- **Every new pane is a Codex chat.** herdr runs `scripts/ovis-shims/pane-shell` for each
+  new pane: `./codex` in the pane's folder, then bash once Codex quits. A new workspace, tab
+  or split, and herdr's first pane (started in `OVIS_CODEX_DIR`, default this folder), open on
+  a Codex chat. Ovis's own **New workspace / New tab** panes are plain, so its agent picker
+  decides. The picker defaults to Codex until a browser picks something else, Shell included.
+  Panes restored after a herdr restart start a fresh Codex (herdr's
+  `resume_agents_on_restore` is kept `false`, or its resume command would be typed into that
+  Codex), and the earlier conversation is one `/resume` away. `OVIS_CODEX_PANE=0` makes new
+  panes plain shells. Detach from `ovis run` with Ctrl+B then Q: Codex keeps running, and
+  Ovis keeps showing it.
+- **Startup.** A Codex TUI loses its session ("No active thread is available", every later
+  message dropped) when keystrokes arrive, or its skills change, before its session thread is
+  up. Keep big, busy folders (a browser profile, logs) out of skill folders: Codex walks every
+  skill folder at startup and reloads the skills of every running Codex on each change there.
+  And keep anything that reads the terminal (`sudo` with `use_pty`, for one) out of the shell's
+  startup files, or it eats the `codex` herdr types into a new pane.
+
+  Ovis also holds a chat message or queued delivery to a Codex pane until that Codex's session
+  thread is up. It reads the start from Codex's own log database, waits at most 180 s, refuses
+  when no Codex runs in the pane, and never types into the shell instead
+  (`patches/ovis/codex-ready.ts`). Typing in the terminal view is not held. A message entered in
+  the New workspace dialog goes to Codex as an argument and is safe.
+- **Commands.** Ovis lists Codex's builtins after `/` and the skills after `$`: this
+  workspace's (`team-solve`, `cxsec-security`, `ghidra-re`, `browser-automation`), the plugin skills
+  (`codex-security:*`, `deepseek-balance:*`, `subagent-labels:*`) and Codex's own.
+  `scripts/ovis_patch.py` brings Ovis's command table, which is pinned to Codex 0.163, up to
+  0.166: `/presets` (opens Codex's saved-prompts picker in the terminal), plus `/model`,
+  `/permissions`, `/title` and `/statusline` with an argument, which act without a picker.
+  The patch also makes Ovis's New workspace / New tab panes plain, sets the picker default
+  above and adds the startup hold. It runs at every `./codex ovis start`, each edited file is pinned to the bundle's
+  original sha256, and it refuses a different bundle without writing anything.
+- **Every pane is the full stack.** `scripts/ovis-shims/codex` is first on herdr's
+  PATH, so `codex` typed into a pane, or started there by Ovis, goes through `./codex`
+  (router, secrets, Landlock cage, patched build). herdr itself runs outside the cage and
+  never sees `secrets.env`. `ovis run` writes the per-launch settings herdr would drop
+  (`CODEX_NET`, `CODEX_HOOK_TRUST`, `CODEX_START_HOOK`, ...) into a 0600 launch script that
+  deletes itself. A fixed list, never a key or token.
+- **Transcripts.** Ovis reads each pane's rollout from the `CODEX_HOME` of its Codex
+  process. The SessionStart hook in `.codex/hooks.json` (`scripts/ovis-codex-hook.sh`, which
+  runs herdr's own Codex hook from the bundle) tells herdr which session the pane runs, so
+  `/resume`, `/new` and several sessions in `.codex/` are followed. It does nothing
+  outside a herdr pane. Measured 2026-11-01: a caged `./codex` in a pane read as
+  `source: codex-transcript`, and the hook reached herdr's socket from inside the cage.
+
+**Network path.** This container publishes no ports, and Docker cannot add one to a
+running container. So:
+
+```
+browser ─► host 127.0.0.1:7327 ─► codex-ovis-gate :7317 ─(codex-ovis network)─► <this container>:7317
+            relay (scripts/ovis_forward.py) ─► Ovis 127.0.0.1:7318 (bun, tools/ovis)
+```
+
+`codex-ovis-gate` runs the same relay from this container's image: read-only root, no
+capabilities, `no-new-privileges`, uid 65534, 64 MB, `--restart unless-stopped`. It is
+recreated when its `docker run` arguments change. `ovis gate ensure` creates the
+`codex-ovis` network and connects this container to it. Ovis binds loopback behind the
+in-container relay because a non-loopback bind shows a permanent "reachable on your
+network" banner. Host port 7317 is Ovis's own default and often taken, so this workspace
+defaults to 7327 (`OVIS_PORT`). `OVIS_GATE=off` publishes nothing (reachable inside this container only).
+
+**Access.** Every request except `/api/health` and the page itself needs the token
+(measured: 401 without it, from the host). The relay listens on all of this container's
+networks, so other containers on them reach the port, and they still need the token.
+`OVIS_TOKEN=off` drops the token: then anything that reaches the port can type into
+Codex until a device is paired, including every program on the Docker host and a web page
+that rebinds its name to 127.0.0.1. Telemetry and self-update are always off.
+
+**Settings** come from the environment, then `.codex/secrets.env` (read as text):
+`OVIS_ENABLED`, `OVIS_TOKEN`, `OVIS_PORT`, `OVIS_GATE`, `OVIS_CODEX_PANE`, `OVIS_CODEX_DIR`.
+State (the token, Ovis's pairing and push keys in `state/`, pasted files in `paste/`) is in
+`.codex/ovis/`, which is git-ignored. Runtime files and the log are in `/tmp/codex-ovis/`, per
+container. The bundle is `remote-v40` (herdr 0.9.3, bun 1.4.2), pinned by sha256 in
+`scripts/ovis.sh` and installed into `tools/ovis/` without compiling anything. This
+workspace's edits to it are `scripts/ovis_patch.py` and `patches/ovis/`. In a herdr pane
+the balance stays in the footer, not in the terminal title, because herdr and Ovis name a pane
+after its title. Tests: `npm run test:ovis`.
+
 ### Other useful commands
 
 ```sh
@@ -405,8 +587,11 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/models.json` | generated catalog (`npm run models`) |
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
 | `.codex/secrets.env` | API keys + router token, mode 600, git-ignored |
+| `.codex/skills/team-solve/` | GVS5H team solver: `scripts/team_solve.py` (loop and agents modes, guards, replay), `SKILL.md`, `NOTICE`, `sample/`; tests in `tests/test_team_solve.py` |
 | `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re` |
-| `router/routes.json` | model prefix → upstream table (`deepseek-*`, `glm-*`), per-route `usageLimit` hold policy (on for `glm-*`) and the `deepseek-flash -> glm-5.3 -> glm-5.3-flash -> glm-5-turbo` policy-failure fallback chain |
+| `router/routes.json` | model prefix → upstream table (`deepseek-*`, `glm-*`), per-route `usageLimit` hold policy (on for `glm-*`) and state-aware fallback chains (`glm-5.3 -> glm-5.3-flash -> glm-5-turbo -> deepseek-flash`, with DeepSeek able to enter GLM) |
+| `scripts/ovis.sh` | `./codex ovis`: the Ovis supervisor (herdr, server, relay), default Codex pane, `run`, the `codex-ovis-gate` container, pinned bundle install; `scripts/ovis_forward.py` (relay), `scripts/ovis-shims/codex` (pane shim), `scripts/ovis-shims/pane-shell` (herdr's pane shell: Codex, then bash), `scripts/ovis-codex-hook.sh` (SessionStart hook), `scripts/ovis_patch.py` + `patches/ovis/` (edits to the bundle) |
+| `tools/ovis/` | the pinned Ovis bundle and herdr's generated Codex hook (git-ignored, `./codex ovis install`) |
 | `setup.sh` | reproduce on a fresh clone; `--check` verifies |
 
 Machine-specific paths that `setup.sh` does not manage: the `ghidra` MCP launcher
@@ -417,7 +602,8 @@ source (`CLAUDE_SKILLS_DIR`, default `~/.claude/skills`). Requires Linux with La
 `cargo`, `rustc`, `git`, `sha256sum`, and `flock` for the patched runtime build.
 
 Not committed (see `.gitignore`): `.codex/secrets.env`, sessions, sqlite state, router
-log/pid, `node_modules`, local integrations, and `.codex/hooks/state/`.
+log/pid, `node_modules`, local integrations, `.codex/hooks/state/`, and `.codex/ovis/`
+(the Ovis token and state).
 
 ## MCP servers
 

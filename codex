@@ -23,21 +23,45 @@ if [[ "${1:-}" == "balance" ]]; then
   exec node "$ROOT/scripts/deepseek-balance.mjs" show "$@"
 fi
 
+# ./codex ovis start|stop|status|token|run|gate|install: the web and phone client
+# (README "Ovis"). Runs outside the cage, before the secrets are loaded.
+if [[ "${1:-}" == "ovis" ]]; then
+  shift
+  exec "$ROOT/scripts/ovis.sh" "$@"
+fi
+
+# ./codex team-solve [args]: the team-solve skill's runner (.codex/skills/team-solve) instead
+# of the Codex TUI, with the same router, secrets and cage. --dir DIR is its work folder.
+TEAM_SOLVE=0
+if [[ "${1:-}" == "team-solve" ]]; then
+  TEAM_SOLVE=1
+  shift
+fi
+
 BIN="$("$ROOT/scripts/resolve-codex-bin.sh")"
 [[ -x "$BIN" ]] || { printf 'codex: %s missing; run: npm install\n' "$BIN" >&2; exit 1; }
 
 "$ROOT/codex-router" ensure >/dev/null
-
-set -a
-# shellcheck disable=SC1091
-. "$ROOT/.codex/secrets.env"
-set +a
 
 # Run an optional integration maintained outside this repository. The hook is an
 # explicit opt-in and failures must not prevent Codex from starting.
 if [[ -n "${CODEX_START_HOOK:-}" && -x "$CODEX_START_HOOK" ]]; then
   "$CODEX_START_HOOK" ensure >/dev/null 2>&1 || true
 fi
+
+# Keep Ovis up (README "Ovis"): interactive launches only, so `exec` runs and other
+# unattended launches never start it. Not from inside the cage (herdr
+# would cage every pane) or a herdr pane (it is up). Detached and before the
+# secrets are loaded, so the TUI never waits and herdr's panes never inherit
+# them. ovis.sh reads OVIS_ENABLED itself.
+if [[ -t 0 && -t 1 && -z "${CODEX_LANDLOCK_CAGE:-}" && "${HERDR_ENV:-}" != 1 ]]; then
+  setsid "$ROOT/scripts/ovis.sh" start --quiet </dev/null >/dev/null 2>&1 &
+fi
+
+set -a
+# shellcheck disable=SC1091
+. "$ROOT/.codex/secrets.env"
+set +a
 
 CAGE_RW=()
 CAGE_NET="${CODEX_NET:-open}"
@@ -53,9 +77,11 @@ prev=""
 for arg in "$@"; do
   case "$prev" in
     -C|--cd) work="$arg" ;;
+    --dir) if (( TEAM_SOLVE )); then work="$arg"; fi ;;
   esac
   case "$arg" in
     --cd=*) work="${arg#--cd=}" ;;
+    --dir=*) if (( TEAM_SOLVE )); then work="${arg#--dir=}"; fi ;;
   esac
   prev="$arg"
 done
@@ -79,10 +105,20 @@ export TMPDIR="${TMPDIR:-/tmp}"
 export CODEX_MANAGED_PACKAGE_ROOT="$ROOT/node_modules/@openai/codex"
 export CODEX_MANAGED_BY_NPM=1
 export DEEPSEEK_BALANCE_CACHE_FILE="$ROOT/.codex/cache/deepseek-balance.json"
-export PATH="$ROOT/scripts:$PATH"
+# Without scripts/ovis-shims, which a herdr pane puts first: a `codex` that Codex
+# itself runs must not go through ./codex and the cage a second time.
+PATH=":$PATH:"
+while [[ "$PATH" == *":$ROOT/scripts/ovis-shims:"* ]]; do
+  PATH="${PATH//":$ROOT/scripts/ovis-shims:"/:}"
+done
+PATH="${PATH#:}"
+export PATH="$ROOT/scripts:${PATH%:}"
 
 # Keep the footer cache fresh outside the Landlock cage. The same daemon also
 # owns the window/tab title unless that fallback is explicitly disabled.
+# In a herdr pane the title stays the shell's: herdr and Ovis name a pane after its
+# terminal title, so every Codex pane was called "DeepSeek $21.45 USD". The daemon
+# still runs there with --no-title, or the footer's balance would go stale.
 balance_title="${CODEX_DEEPSEEK_BALANCE_TITLE:-auto}"
 balance_args=(
   title
@@ -91,7 +127,7 @@ balance_args=(
   --project "$work"
   --cache-file "$DEEPSEEK_BALANCE_CACHE_FILE"
 )
-if [[ "$balance_title" == "off" ]]; then
+if [[ "$balance_title" == "off" || "${HERDR_ENV:-}" == 1 ]]; then
   balance_args+=(--no-title)
 fi
 if [[ -t 1 ]]; then
@@ -113,4 +149,14 @@ if [[ "${CODEX_HOOK_TRUST:-bypass}" != "strict" ]]; then
 fi
 
 cd "$work"
+if (( TEAM_SOLVE )); then
+  # The agents mode spawns this same Codex binary for each role. --dir is re-passed as the
+  # resolved absolute folder (argparse keeps the last one): a relative --dir would now
+  # resolve against the folder we just cd'd into.
+  export CODEX_WORKSPACE_BIN="$BIN"
+  ts_args=("$@")
+  case "${1:-}" in run|check|status) ts_args+=(--dir "$work") ;; esac
+  exec python3 "$CAGE" "${cage_args[@]}" -- \
+    python3 "$ROOT/.codex/skills/team-solve/scripts/team_solve.py" "${ts_args[@]}"
+fi
 exec python3 "$CAGE" "${cage_args[@]}" -- "$BIN" "${hook_args[@]}" "$@"
