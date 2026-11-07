@@ -32,6 +32,14 @@ STATE_DIR = ".team-solve"
 # The literal ":(exclude).team-solve" makes `git add` exit 1 in the shadow repository, where
 # .team-solve/ is also in info/exclude ("paths are ignored"); the glob form works in both.
 EXCLUDES = (":(exclude,glob)**/.team-solve/**", ":(exclude,glob)**/__pycache__/**")
+# Secrets never enter a state: their content would land in the object store (kept alive by the
+# run's refs), in every diff a model reads, and in the keep net's restores.
+SECRET_EXCLUDES = (
+    ":(exclude,glob).env", ":(exclude,glob).env.*", ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*",
+    ":(exclude,glob)**/*.pem", ":(exclude,glob)**/*.key", ":(exclude,glob)**/*.p12", ":(exclude,glob)**/*.pfx",
+    ":(exclude,glob)**/*secret*", ":(exclude,glob)**/*credential*",
+    ":(exclude,glob)**/id_rsa", ":(exclude,glob)**/id_ed25519",
+)
 SHADOW_EXCLUDES = (".team-solve/", "__pycache__/", "node_modules/", ".venv/", "venv/", "target/",
                    ".mypy_cache/", ".pytest_cache/", "*.pyc")
 IDENTITY = {"GIT_AUTHOR_NAME": "team-solve", "GIT_AUTHOR_EMAIL": "team-solve@localhost",
@@ -110,7 +118,12 @@ class Tree:
                 seeded = True
             for attempt in range(3):
                 try:
-                    self.git("add", "-A", "--", ".", *EXCLUDES, env=env)
+                    self.git("add", "-A", "--", ".", *EXCLUDES, *SECRET_EXCLUDES, env=env)
+                    # A tracked secret stays in the seeded index: drop it from the state.
+                    tracked = self.git("ls-files", "-z", "--cached", "--", ".", env=env).split("\0")
+                    secret = [p for p in tracked if p and _secret(p)]
+                    if secret:
+                        self.git("rm", "-q", "--cached", "--ignore-unmatch", "--", *secret, env=env)
                     return self.git("write-tree", env=env).strip()
                 except GitError:
                     if attempt == 0 and seeded and self.git("rev-parse", "-q", "--verify", "HEAD", check=False).strip():
@@ -249,18 +262,23 @@ class Tree:
         needs node_modules or a venv runs there as it would in place. Returns the folder that
         corresponds to ws inside dest."""
         os.makedirs(dest, exist_ok=True)
-        data = self.git("archive", "--format=tar", self._read("base-commit.txt"), binary=True)
-        fd, tar_path = tempfile.mkstemp(prefix="team-solve-base-", suffix=".tar")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            with tarfile.open(tar_path) as t:
-                try:
-                    t.extractall(dest, filter="tar")
-                except TypeError:
-                    t.extractall(dest)
-        finally:
-            os.unlink(tar_path)
+        # An empty start (a new folder) has nothing to extract, and `git archive` of its base
+        # commit is no tar that tarfile reads (measured: ReadError, which crashed the run).
+        if self.git("ls-tree", "--name-only", self.base).strip():
+            data = self.git("archive", "--format=tar", self._read("base-commit.txt"), binary=True)
+            fd, tar_path = tempfile.mkstemp(prefix="team-solve-base-", suffix=".tar")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                with tarfile.open(tar_path) as t:
+                    try:
+                        t.extractall(dest, filter="tar")
+                    except TypeError:
+                        t.extractall(dest)
+            except tarfile.TarError as e:
+                raise GitError(f"could not extract the start of the run: {e}") from e
+            finally:
+                os.unlink(tar_path)
         ignored = subprocess.run(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
                                  cwd=self.top, env=self.env, capture_output=True, text=True, timeout=GIT_TIMEOUT_SEC)
         for entry in ignored.stdout.split("\0"):
@@ -273,6 +291,13 @@ class Tree:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst)
         return os.path.join(dest, self.prefix) if self.prefix else dest
+
+
+def _secret(path):
+    name = path.rsplit("/", 1)[-1]
+    low = name.lower()
+    return (name in (".env", "id_rsa", "id_ed25519") or name.startswith(".env.")
+            or low.endswith((".pem", ".key", ".p12", ".pfx")) or "secret" in low or "credential" in low)
 
 
 def _prune_empty_dirs(root, d):

@@ -458,8 +458,9 @@ keep (the net) - final check
   latest work.
 - **The tree.** Every state is a git tree written through a private index, so the
   project's index, branch and stash are never touched. A state holds untracked files too,
-  so an edit to a file that was already untracked shows up. A role that moves HEAD gets it
-  put back. Outside git, a shadow repository in `.team-solve/shadow.git` gives the same
+  so an edit to a file that was already untracked shows up. Secrets (`.env*`, `*.pem`,
+  `*.key`, `*secret*`, `*credential*`) never enter a state, a diff or a restore. A role that
+  moves HEAD gets it put back. Outside git, a shadow repository in `.team-solve/shadow.git` gives the same
   diff, snapshots and keep net. The run's files are in `.team-solve/runs/<id>/` (`task.md`,
   `plan.md`, `notes.md`, `changes.diff`, `review-N.md`, `verdict-N.md`, `keep.txt`,
   `final-check.log`, `calls/`), and `.team-solve/` is git-ignored by its own `.gitignore`.

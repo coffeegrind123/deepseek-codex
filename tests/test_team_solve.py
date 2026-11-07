@@ -1053,3 +1053,38 @@ def test_agent_prompts_have_no_unfilled_fields():
         assert "{" not in text.replace("{len", "")
     assert "verdict.md" in prompts.repair_prompt("r", 1, True) and "verdict.md" not in prompts.repair_prompt("r", 1, False)
     assert "could not decide" in prompts.judge_user("t", "d", "log") and "Check printed" not in prompts.judge_user("t", "d")
+
+
+def test_tree_states_keep_secrets_out(tmp_path):
+    ws = str(tmp_path / "w")
+    git_repo(ws, {"a.txt": "a\n", ".env": "KEY=one\n"})                   # a tracked .env, as some repos have
+    open(os.path.join(ws, "cfg.secret"), "w").write("s\n")
+    open(os.path.join(ws, "server.pem"), "w").write("PEM\n")
+    rd = str(tmp_path / "rd")
+    os.makedirs(rd)
+    ledger.ensure_state_dir(ws)
+    t = gitstate.Tree(ws, rd, "r1", lambda *a: None)
+    t.start()
+    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", t.base], cwd=ws, capture_output=True,
+                           text=True).stdout.split()
+    assert names == ["a.txt"]                                              # no secret content in the object store
+    open(os.path.join(ws, ".env"), "w").write("KEY=two\n")
+    open(os.path.join(ws, "a.txt"), "w").write("A\n")
+    assert "KEY=two" not in t.changes() and [p for _, _, p in t.changed_files()] == ["a.txt"]
+    t.restore_tree(t.base)
+    assert open(os.path.join(ws, ".env")).read() == "KEY=two\n"            # a restore never touches a secret
+
+
+def test_baseline_copy_of_an_empty_start(tmp_path):
+    ws = str(tmp_path / "w")
+    os.makedirs(ws)
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    rd = str(tmp_path / "rd")
+    os.makedirs(rd)
+    ledger.ensure_state_dir(ws)
+    t = gitstate.Tree(ws, rd, "r1", lambda *a: None)
+    t.start()
+    open(os.path.join(ws, "new.txt"), "w").write("n\n")
+    dest = str(tmp_path / "copy")
+    cwd = t.baseline_copy(dest)
+    assert os.path.isdir(cwd) and not os.path.exists(os.path.join(cwd, "new.txt"))
