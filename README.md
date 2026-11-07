@@ -10,7 +10,7 @@ git clone git@github.com:coffeegrind123/deepseek-codex.git codex && cd codex
 ./codex exec 'prompt' </dev/null   non-interactive; close stdin or exec waits for piped input
 ./codex-router status|logs   the model router
 npm test                     router unit tests
-./codex team-solve run --dir D  GVS5H team solver on D/task.md + D/tests/ (README "Team solve")
+./codex team-solve "task" [--until "end"]  team of fresh roles on a task from a prompt (README "Team solve")
 npm run models               regenerate .codex/models.json from .codex/catalog/
 ./codex ovis status|token|run   Ovis: Codex sessions in a browser or phone (README "Ovis")
 ```
@@ -363,45 +363,88 @@ ghcr.io/openai/codex-security:<ver>`), then re-run `./setup.sh`. Cloud, Linear a
 
 ### Team solve (GVS5H)
 
-`.codex/skills/team-solve/` runs the GVS5H method (Lee, 2026: five Qwen3.8-27B roles matched
-Fable 5 on LiveCodeBench Hard) on this workspace's models. A planner, an ideator, a manager
-that owns the task list, workers and a cut-off summarizer each start from a fresh context
-and share only files (`plan.md`, `notes.md`, `tasks.json`, …), for up to 10 rounds. A
-**check, not a model, decides success each round** — that feedback is what makes the loop
-beat a single call. The check is either the built-in public-sample runner (contest
-problems) or a command you supply (`--verify-cmd`): make a test suite pass, make a build
-compile, satisfy a grader, hit a benchmark, reproduce an output — exit 0 means solved. Port
-of memdoor's `examples/workflows/team-solve`; provenance and licences in the skill's `NOTICE`.
+`.codex/skills/team-solve/` runs a team of fresh-context roles that share only files, with
+a check deciding each round. Two modes:
+
+- **agents mode: a task from a prompt.** Port of memdoor's built-in team-solve
+  (`workflows/team-solve` at `47dad8b`). You hand it a sentence, and it works in the current
+  folder, usually a project. A planner settles the **Check**: a command in backticks, the
+  public samples, or the **judge** when nothing can be run. `--until "sentence"` is your
+  own end condition: it becomes the first line of Done when, word for word, and the run
+  is not done until it holds. `--verify-cmd` fixes the Check.
+- **loop mode: the GVS5H method itself** (Lee, 2026: five Qwen3.8-27B roles matched Fable 5
+  on LiveCodeBench Hard). A planner, an ideator, a manager that owns the task list, workers
+  and a cut-off summarizer, for up to 10 rounds, writing one file and checked by the
+  samples or a `--verify-cmd`. Byte-identical to the authors' prompts.
+
+Provenance and licences are in the skill's `NOTICE`.
 
 ```sh
-./codex team-solve run --dir my-task                             # contest: task.md + tests/N.in/N.out
+./codex team-solve "Rename ReadGGUF to ParseGGUF everywhere; go test ./... must pass"
+./codex team-solve "Write docs/branching.md for new teammates" --until "it names the feature/ prefix and the review rule"
+./codex team-solve "Fix the flaky retry in client.py" --verify-cmd "pytest -q tests/test_client.py"
+./codex team-solve - < task.md                                   # a long prompt
+./codex team-solve run --dir my-task                             # contest: task.md + tests/N.in/N.out (loop)
 ./codex team-solve run --dir my-task --keep-best --stress        # contest, both guards
-./codex team-solve run --dir my-task --verify-cmd "pytest -q"    # generic: loop writes one Python file
-./codex team-solve run --dir my-task --verify-cmd "make" --mode agents  # generic: agents edit the workspace
-./codex team-solve status --dir my-task                          # rounds, verdicts, tokens
-./codex team-solve check  --dir my-task [--verify-cmd "CMD"]     # the strict check on its own
+./codex team-solve run --dir my-task --verify-cmd "pytest -q"    # loop: one Python file passing a command
+./codex team-solve status [--dir D]                              # rounds, verdicts, keep, tokens
+./codex team-solve check  [--dir D] [--verify-cmd "CMD"]         # the strict check on its own
 ```
 
-Inside a Codex session the orchestrator uses it as the `$team-solve` skill. Exit 0 means
-solved (the check passed), 1 means not solved, 2 means infrastructure failure.
+Inside a Codex session the orchestrator uses it as the `$team-solve` skill: `$team-solve do
+this and this` (Codex 0.166 has no custom slash commands, so `/team-solve` cannot be
+added). Exit 0 means solved, 1 means not solved, 2 means an infrastructure failure.
+
+**Agents mode, step by step** (each role starts fresh; llm roles are one tool-less router call):
+
+```
+problem -+- direct (codex: the prompt as written) ----------+- test-0 -+- passed -------------------------------+
+         +- outline - plan (llm) - settle - baseline -------+          +- failed: context - ideate a||b - solve --+
+round r: test - review (llm) - [judge (llm, has seen none of the team's reasoning)] -> accepted, or repair (codex) -> r+1
+keep (the net) - final check
+```
+
+- **First the single call, then the team.** `direct` is one agent turn on your words.
+  When it passes the Check, only the review (and the judge, when needed) runs after it.
+- **A round is accepted** when the Check passes (or there is none to run), the review does
+  not FAIL, and the fresh judge says PASS whenever a command cannot settle it alone (no
+  command, a repaired change, a review with no clear verdict). The samples decide alone.
+  Rounds repeat up to `--max-iters` (10), and stop early when a repair changes nothing.
+  Memdoor has one repair round.
+- **Baseline.** A command Check first runs on a copy of the tree as found, with ignored
+  dependencies linked in. Tests that already fail there do not count: only failures the
+  change adds count (pytest, unittest, Django, go test logs). A failure that reads exactly
+  as before is passed to the judge, with the log. Any other failure counts against the
+  change. Memdoor switches the Check off there, and its judge never sees the log.
+- **The keep net.** The team's work replaces the direct attempt only when it is better
+  proven. With a command or samples it puts the direct attempt back (the team's work goes
+  to `team.patch`). With a judge-only task, where neither can be proven, it keeps the
+  latest work.
+- **The tree.** Every state is a git tree written through a private index, so the
+  project's index, branch and stash are never touched. A state holds untracked files too,
+  so an edit to a file that was already untracked shows up. A role that moves HEAD gets it
+  put back. Outside git, a shadow repository in `.team-solve/shadow.git` gives the same
+  diff, snapshots and keep net. The run's files are in `.team-solve/runs/<id>/` (`task.md`,
+  `plan.md`, `notes.md`, `changes.diff`, `review-N.md`, `verdict-N.md`, `keep.txt`,
+  `final-check.log`, `calls/`), and `.team-solve/` is git-ignored by its own `.gitignore`.
+- **Resume.** Rerunning the same prompt while its run is unfinished continues from the
+  first unfinished step; the llm calls replay from the run's `calls/`. `--fresh` starts
+  a new run.
+- With the judge as the Check, the verdict is two models agreeing, not a command:
+  `status` and the final line say **judged, not checked**.
+
+**Loop mode, in detail:**
 
 - **The check is the ground truth.** Without `--verify-cmd` it is the public-sample runner
   (contest problems, `tests/N.in`/`N.out`). With `--verify-cmd "CMD"` the team iterates
   until `CMD`, run in the folder, exits 0, and the command's output is the manager's
   feedback each round; `--verify-cmd` implies the neutral `generic` solver spec.
-- **`--mode loop` (default)** is the authors' loop, one tool-less model call per role, sent
-  straight to the router's `/v1/responses` (streamed, because the router cuts an upstream
-  silent for 600 s). Authors' temperatures (0.2–0.4), top_p 0.95, 128K reply cap. The
-  artifact is one file (`solution.py`, or `--solution-file`), so loop + `--verify-cmd` is
-  "write one Python file that passes this check". `tests/test_team_solve.py` runs the
-  authors' own `multiagent.py` (fetched at a pinned commit by `tests/fetch_gvs5h.sh`) and
-  this port against one scripted model, and requires every request to be byte-identical
-  across four scenarios.
-- **`--mode agents`** runs memdoor's eight steps: plan → ideate-a ∥ ideate-b → solve →
-  test → review → repair → verify. Each role is `codex -a never exec --disable multi_agent`
-  in the folder, editing the whole workspace; test and verify run the check. With
-  `--verify-cmd` the roles are told to edit whatever files the task needs — this is the
-  general, whole-workspace path. A role costs a full agent turn.
+- One tool-less model call per role, sent straight to the router's `/v1/responses`
+  (streamed, because the router cuts an upstream silent for 600 s). Authors' temperatures
+  (0.2–0.4), top_p 0.95, 128K reply cap. The artifact is one file (`solution.py`, or
+  `--solution-file`). `tests/test_team_solve.py` runs the authors' own `multiagent.py`
+  (fetched at a pinned commit by `tests/fetch_gvs5h.sh`) and this port against one
+  scripted model, and requires every request to be byte-identical across four scenarios.
 - **Guards (sample mode), off by default so the default stays the authors' method.** Both
   close gaps that cost memdoor points in its 5-pass run. `--keep-best` restores the last
   passing program when the final one fails (works with `--verify-cmd` too). `--stress` has
@@ -410,17 +453,18 @@ solved (the check passed), 1 means not solved, 2 means infrastructure failure.
   overrides the manager's "done".
 - **Resume by replay.** Rerunning the same command replays every recorded call whose
   request is byte-identical (`.team-solve/calls/`), continuing live from the first that
-  differs, so an interrupted run costs nothing to finish. `--fresh` starts an independent
-  attempt.
+  differs. `--fresh` starts an independent attempt.
 - Also supported: `--samples all` (LeetCode-style `tests/func_name` samples inside the
   loop), `--spec aime|math500|gpqa|hle` (the authors' math/QA prompts, result in
   `answer.md`), `--model` for any routed model.
+- `--mode auto` (the default) picks agents mode for a prompt, an `--until`, or a folder
+  with nothing to check, and loop mode for samples, a `--verify-cmd` folder or a math spec.
 
 Measured 2026-11-01 on deepseek-flash:
 - contest sample (balanced substrings, N ≤ 200000), loop mode `--keep-best --stress`:
   solved in 91 s and 6 calls, 4.7K in / 6.1K out tokens, brute force agreed 200/200. Agents
-  mode on the same problem: 611 s, 1.11M in (1.08M cached) / 30K out — about 100x the loop
-  input volume.
+  mode on the same problem (the earlier eight-step agents shape, since replaced): 611 s,
+  1.11M in (1.08M cached) / 30K out — about 100x the loop input volume.
 - `--verify-cmd` loop mode (a Fibonacci task checked by a `check.py` script): solved in
   23 s and 5 calls, 3.6K in / 2.8K out tokens.
 
@@ -587,7 +631,7 @@ browser and Ghidra MCP servers, which need the network).
 | `.codex/models.json` | generated catalog (`npm run models`) |
 | `.codex/cage.conf` | extra writable roots and net mode for the cage |
 | `.codex/secrets.env` | API keys + router token, mode 600, git-ignored |
-| `.codex/skills/team-solve/` | GVS5H team solver: `scripts/team_solve.py` (loop and agents modes, guards, replay), `SKILL.md`, `NOTICE`, `sample/`; tests in `tests/test_team_solve.py` |
+| `.codex/skills/team-solve/` | team solver: `scripts/team_solve.py` (agents mode: a task from a prompt, `teamsolve/pipeline.py`; loop mode: GVS5H with guards and replay), `SKILL.md`, `NOTICE`, `sample/`; tests in `tests/test_team_solve.py` |
 | `.codex/skills/` | symlinks to `~/.claude/skills/browser-automation` and `ghidra-re` |
 | `router/routes.json` | model prefix → upstream table (`deepseek-*`, `glm-*`), per-route `usageLimit` hold policy (on for `glm-*`) and state-aware fallback chains (`glm-5.3 -> glm-5.3-flash -> glm-5-turbo -> deepseek-flash`, with DeepSeek able to enter GLM) |
 | `scripts/ovis.sh` | `./codex ovis`: the Ovis supervisor (herdr, server, relay), default Codex pane, `run`, the `codex-ovis-gate` container, pinned bundle install; `scripts/ovis_forward.py` (relay), `scripts/ovis-shims/codex` (pane shim), `scripts/ovis-shims/pane-shell` (herdr's pane shell: Codex, then bash), `scripts/ovis-codex-hook.sh` (SessionStart hook), `scripts/ovis_patch.py` + `patches/ovis/` (edits to the bundle) |

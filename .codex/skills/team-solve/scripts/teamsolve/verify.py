@@ -2,17 +2,16 @@
 a model's say-so. That check is what makes the team loop beat a single call, so it stays
 the engine whatever the task.
 
-Two verifiers, one interface:
+The loop's default is the authors' public-sample check, run by samples.py directly: the
+loop's byte-for-byte parity with their code depends on that path being theirs. This module
+holds the other one:
 
-* SampleVerifier -- the authors' public-sample check. The loop's byte-for-byte parity with
-  their code depends on the default path running samples exactly as they do, so the loop
-  keeps calling samples.py directly on this path; this class only carries the final strict
-  verdict (team_solve's `check`), which was already the sample checker.
 * CommandVerifier -- a user-supplied command run in the workspace. Exit 0 is solved; its
   output is the feedback the manager reads. That turns the same loop into a solver for any
   task whose success you can check with a command: make a test suite pass, make a build
-  compile, satisfy a grader, hit a benchmark, reproduce an output. Contest samples are then
-  just the built-in default.
+  compile, satisfy a grader, hit a benchmark, reproduce an output.
+
+Agents mode (pipeline.py) settles its own Check per run: a command, the samples, or a judge.
 
 `round(ws)` returns a result shaped like samples.run_samples (ran/passed/total/fail) plus
 `ok` and the manager `text`, so the loop's existing done-override arithmetic
@@ -23,18 +22,6 @@ import subprocess
 
 FEEDBACK_TAIL = 4000
 TIMEOUT_EXIT = 124
-
-
-class SampleVerifier:
-    kind = "samples"
-
-    def __init__(self, python, include_functional):
-        self.python = python
-        self.include_functional = include_functional
-
-    def verdict(self, ws, out):
-        from . import samples
-        return samples.check(ws, self.python, out)
 
 
 class CommandVerifier:

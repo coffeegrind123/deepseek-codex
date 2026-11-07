@@ -1,5 +1,6 @@
 """team-solve skill: parity with the authors' loop, replay, guards, client wire handling,
-the sample checker, agent mode and the CLI.
+the sample checker, agents mode (a task from a prompt: settle, baseline, rounds, judge,
+keep net, tree snapshots) and the CLI.
 
 python3 -m pytest -q tests/test_team_solve.py   (npm run test:team-solve fetches the reference)
 
@@ -26,7 +27,8 @@ SCRIPTS = os.path.join(SKILL, "scripts")
 CLI = os.path.join(SCRIPTS, "team_solve.py")
 sys.path.insert(0, SCRIPTS)
 
-from teamsolve import agents, client, ledger, loop, prompts, samples, verify  # noqa: E402
+from teamsolve import client, failures, gitstate, ledger, loop, pipeline, prompts, samples, verify  # noqa: E402
+from teamsolve import task as tasklib  # noqa: E402
 
 PROBLEM = ("### Question\nAdd two numbers.\n\n### Format: Read the inputs from stdin solve the problem and "
            "write the answer to stdout (do not directly test on the sample inputs). Enclose your code "
@@ -620,7 +622,9 @@ def test_cli_router_down_is_exit_2(tmp_path):
     assert r.returncode == 2 and "router not reachable" in r.stderr
 
 
-# --- agent mode against a fake codex ------------------------------------------------------
+
+
+# --- agents mode: a task from a prompt --------------------------------------------------
 
 FAKE_CODEX = r"""#!/usr/bin/env python3
 import json, os, sys
@@ -630,89 +634,422 @@ ws = args[args.index("--cd") + 1]
 assert "--disable" in args and args[args.index("--disable") + 1] == "multi_agent"
 assert 'skills.config=[{name="team-solve",enabled=false}]' in args
 assert args[args.index("-a") + 1] == "never" and "exec" in args
-open(os.path.join(ws, "roles.log"), "a").write(role + "\n")
-def w(n, s): open(os.path.join(ws, n), "w").write(s)
-if role == "plan":
-    w("plan.md", "plan\n"); w("notes.md", "## Proposal A\n<!-- proposal-a -->\n## Proposal B\n<!-- proposal-b -->\n")
-elif role == "solve":
-    w("solution.py", os.environ.get("FAKE_FIRST", "print(0)") + "\n")
-elif role == "review":
-    w("review.md", "status " + open(os.path.join(ws, "test-status.txt")).read())
-elif role == "repair":
-    if open(os.path.join(ws, "test-status.txt")).read().strip() != "0":
-        w("solution.py", os.environ["FAKE_FIX"] + "\n")
+key = role + (":resume" if "resume" in args else "")
+open(os.environ["FAKE_LOG"], "a").write(key + "\n")
+actions = json.load(open(os.environ["FAKE_ACTIONS"]))
+run = open(os.path.join(ws, ".team-solve", "runs", "latest")).read().strip()
+for path, content in actions.get(key, []):
+    p = os.path.join(ws, path.replace("@RUN@", os.path.join(".team-solve", "runs", run)))
+    if content is None:
+        os.unlink(p)
+    else:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(content)
+print(json.dumps({"type": "thread.started", "thread_id": "t-" + role}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 7}}))
-sys.exit(int(os.environ.get("FAKE_FAIL_" + role.replace("-", "_").upper(), "0")))
+sys.exit(int(actions.get("fail:" + key, 0)))
 """
 
 
-def fake_codex(tmp_path):
-    p = tmp_path / "fake-codex"
-    p.write_text(FAKE_CODEX)
-    p.chmod(0o755)
-    return str(p)
+class RoleRouter(http.server.BaseHTTPRequestHandler):
+    """Answers each llm role of agents mode by what its message asks (the two ideators run at
+    once, so a queue would be racy). script: {"plan": str, "ideate": str, "review": [..], "judge": [..]}."""
+    script, seen, used = {}, [], {}
+    lock = threading.Lock()
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        user = body["input"][-1]["content"]
+        if "You are the planner of a team" in user:
+            name = "plan"
+        elif "You are independent ideator A" in user:
+            name = "ideate-a"
+        elif "You are independent ideator B" in user:
+            name = "ideate-b"
+        elif "You are the reviewer." in user:
+            name = "review"
+        elif "You are the judge" in user:
+            name = "judge"
+        else:
+            name = "unknown"
+        with RoleRouter.lock:
+            RoleRouter.seen.append((name, user))
+            entry = RoleRouter.script.get(name.split("-")[0] if name.startswith("ideate") else name, "")
+            if isinstance(entry, list):
+                i = RoleRouter.used.get(name, 0)
+                RoleRouter.used[name] = i + 1
+                entry = entry[min(i, len(entry) - 1)]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        resp = {"type": "response.completed", "response": {
+            "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": entry}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}}}
+        self.wfile.write(f"event: response.completed\ndata: {json.dumps(resp)}\n\n".encode())
 
 
-def test_agents_mode_repairs_and_verifies(tmp_path):
-    ws = make_ws(str(tmp_path / "p"))
-    env = dict(os.environ, CODEX_WORKSPACE_BIN=fake_codex(tmp_path), FAKE_FIRST=BAD, FAKE_FIX=GOOD)
-    r = subprocess.run([sys.executable, CLI, "run", "--mode", "agents", "--dir", ws],
-                       capture_output=True, text=True, env=env, timeout=120)
+@pytest.fixture
+def role_router():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RoleRouter)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    RoleRouter.script, RoleRouter.seen, RoleRouter.used = {}, [], {}
+    yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    srv.shutdown()
+
+
+def plan_reply(check, scope, done="- the prompt is done"):
+    return (f"## Deliverable\nchanges to this tree\n\n## Check\n{check}\n\n## Scope\n{scope}\n\n"
+            f"## Done when\n{done}\n\n## Approach\ndo it")
+
+
+def agents_env(tmp_path, base, actions):
+    fake = tmp_path / "fake-codex"
+    fake.write_text(FAKE_CODEX)
+    fake.chmod(0o755)
+    act = tmp_path / f"actions-{len(os.listdir(tmp_path))}.json"
+    act.write_text(json.dumps(actions))
+    # No .pyc: the fake roles rewrite calc.py with a same-size body within one second, and
+    # Python's cache (keyed on source mtime and size) would run the old one.
+    return dict(os.environ, PYTHONDONTWRITEBYTECODE="1", CODEX_WORKSPACE_BIN=str(fake), FAKE_ACTIONS=str(act), FAKE_LOG=str(tmp_path / "roles.log"),
+                TEAM_SOLVE_BASE_URL=base, TEAM_SOLVE_API_KEY="t")
+
+
+def roles_run(tmp_path):
+    p = tmp_path / "roles.log"
+    return p.read_text().split() if p.exists() else []
+
+
+def cli(args, env, timeout=180):
+    return subprocess.run([sys.executable, CLI, *args], capture_output=True, text=True, env=env, timeout=timeout)
+
+
+def git_repo(path, files):
+    os.makedirs(path, exist_ok=True)
+    for name, content in files.items():
+        open(os.path.join(path, name), "w").write(content)
+    for cmd in (["init", "-q"], ["add", "-A"],
+                ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "start"]):
+        subprocess.run(["git", *cmd], cwd=path, check=True, capture_output=True)
+    return path
+
+
+CALC_TEST = "from calc import add\nassert add(2, 3) == 5, add(2, 3)\nassert add(1, 1) == 2\nprint('ok')\n"
+
+
+def test_agents_judge_only_task_with_until_repairs_until_both_models_pass(role_router, tmp_path):
+    ws = str(tmp_path / "proj")
+    os.makedirs(ws)
+    open(os.path.join(ws, "README.md"), "w").write("a project\n")
+    RoleRouter.script = {
+        "plan": plan_reply("judge", "`answer.md`", "- (inferred) two lines"),
+        "review": ["verdict: FAIL\nno prefix named\nrepair: name feature/", "verdict: PASS\nnames feature/"],
+        "judge": ["verdict: PASS\nthe end condition holds"],
+    }
+    env = agents_env(tmp_path, role_router, {
+        "direct": [["answer.md", "use any name\n"]],
+        "repair-1": [["answer.md", "use feature/<topic>\n"], ["@RUN@/repair.md", "named the prefix\n"]],
+    })
+    r = cli(["Write answer.md: a two-line note on naming git branches", "--until", "answer.md names the prefix feature/",
+             "--dir", ws], env)
     assert r.returncode == 0, r.stderr
-    roles = open(os.path.join(ws, "roles.log")).read().split()
-    assert roles[0] == "plan" and set(roles[1:3]) == {"ideate-a", "ideate-b"}
-    assert roles[3:] == ["solve", "review", "repair"]
-    assert ledger.read(ws, "test-status.txt").strip() == "1"
-    assert "failures: 0" in ledger.read(ws, "final-test-output.log")
+    assert roles_run(tmp_path) == ["direct", "repair-1"]
+    assert [n for n, _ in RoleRouter.seen] == ["plan", "review", "review", "judge"]
+    assert "judged, not checked" in r.stderr
+    assert open(os.path.join(ws, "answer.md")).read() == "use feature/<topic>\n"
     rec = json.load(open(ledger.state_path(ws, "run.json")))
-    assert rec["result"]["usage"] == {"input_tokens": 600, "output_tokens": 42}
+    res = rec["result"]
+    assert res["check_kind"] == "judge" and res["accepted"] and res["rounds"] == 2 and rec["options"]["mode"] == "agents"
+    rd = os.path.join(ws, res["run_dir"])
+    task = open(os.path.join(rd, "task.md")).read()
+    assert tasklib.section(task, "Done when").split("\n")[0] == "- answer.md names the prefix feature/"
+    assert "End condition (the run is done only when this holds): answer.md names the prefix feature/" in \
+        open(os.path.join(rd, "prompt.md")).read()
+    # the end condition reaches every model role, inside the task
+    assert all("answer.md names the prefix feature/" in u for _, u in RoleRouter.seen)
+    assert os.path.isdir(os.path.join(ws, ".team-solve", "shadow.git"))   # not a repository: the shadow
+    s = cli(["status", "--dir", ws], env)
+    assert s.returncode == 0 and "judged, not checked" in s.stdout and "end condition:" in s.stdout
+    c = cli(["check", "--dir", ws], env)
+    assert c.returncode == 0 and "judge said PASS" in c.stdout
 
 
-def test_agents_mode_unrepaired_is_exit_1_and_failed_role_is_exit_2(tmp_path):
-    ws = make_ws(str(tmp_path / "p"))
-    env = dict(os.environ, CODEX_WORKSPACE_BIN=fake_codex(tmp_path), FAKE_FIRST=BAD, FAKE_FIX=BAD)
-    r = subprocess.run([sys.executable, CLI, "run", "--mode", "agents", "--dir", ws],
-                       capture_output=True, text=True, env=env, timeout=120)
+def test_agents_command_check_in_a_repo_team_takes_over_and_leaves_git_clean(role_router, tmp_path):
+    ws = git_repo(str(tmp_path / "repo"), {"calc.py": "def add(a, b):\n    return a - b\n", "test_calc.py": CALC_TEST})
+    open(os.path.join(ws, "notes.txt"), "w").write("mine, untracked before the run\n")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws, capture_output=True, text=True).stdout
+    RoleRouter.script = {"plan": plan_reply("`python3 test_calc.py`", "`calc.py`"), "ideate": "use +\nline\nline\nline\nline",
+                         "review": ["verdict: PASS\nfixed"], "judge": ["verdict: FAIL\nshould not be asked"]}
+    env = agents_env(tmp_path, role_router, {
+        "direct": [["calc.py", "def add(a, b):\n    return a * b\n"]],
+        "solve": [["calc.py", "def add(a, b):\n    return a + b\n"]],
+    })
+    r = cli(["Fix add in calc.py. Check: python3 test_calc.py passes.", "--dir", ws], env)
+    assert r.returncode == 0, r.stderr
+    assert roles_run(tmp_path) == ["direct", "solve"]
+    names = [n for n, _ in RoleRouter.seen]
+    assert set(names) == {"plan", "ideate-a", "ideate-b", "review"} and "judge" not in names
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=ws, capture_output=True, text=True).stdout
+    # no .team-solve, notes untouched (__pycache__ is the Check's own import of calc.py)
+    assert sorted(l for l in status.splitlines() if "__pycache__" not in l) == [" M calc.py", "?? notes.txt"]
+    assert subprocess.run(["git", "rev-parse", "HEAD"], cwd=ws, capture_output=True, text=True).stdout == head
+    res = json.load(open(ledger.state_path(ws, "run.json")))["result"]
+    rd = os.path.join(ws, res["run_dir"])
+    diff = open(os.path.join(rd, "changes.diff")).read()
+    assert "calc.py" in diff and "notes.txt" not in diff
+    assert open(os.path.join(rd, "baseline-status.txt")).read().strip() == "1"   # the bug fails the Check at start
+    assert res["check_kind"] == "command" and res["check_cmd"] == "python3 test_calc.py" and not res["direct_passed"]
+    assert "checked by `python3 test_calc.py`" in r.stderr
+
+
+def test_agents_keep_net_puts_the_direct_attempt_back(role_router, tmp_path):
+    ws = git_repo(str(tmp_path / "repo"), {"calc.py": "def add(a, b):\n    return a - b\n", "test_calc.py": CALC_TEST})
+    RoleRouter.script = {"plan": plan_reply("`python3 test_calc.py`", "`calc.py`"), "ideate": "x\nx\nx\nx\nx",
+                         "review": ["verdict: FAIL\nstill wrong\nrepair: try harder"]}
+    env = agents_env(tmp_path, role_router, {
+        "direct": [["calc.py", "def add(a, b):\n    return a * b\n"]],
+        "solve": [["calc.py", "def add(a, b):\n    return 0\n"]],
+        "repair-1": [["calc.py", "def add(a, b):\n    return 1\n"], ["@RUN@/repair.md", "tried 1\n"]],
+    })
+    r = cli(["Fix add in calc.py", "--verify-cmd", "python3 test_calc.py", "--max-iters", "2", "--dir", ws], env)
     assert r.returncode == 1, r.stderr
-    ws2 = make_ws(str(tmp_path / "q"))
-    env.update(FAKE_FAIL_SOLVE="3")
-    r = subprocess.run([sys.executable, CLI, "run", "--mode", "agents", "--dir", ws2],
-                       capture_output=True, text=True, env=env, timeout=120)
-    assert r.returncode == 2 and "agent step 'solve' failed" in r.stderr
-    # solve was attempted twice (max_retries: 1), and plan/ideate are resumable markers now
-    assert open(os.path.join(ws2, "roles.log")).read().split().count("solve") == 2
-    assert os.path.exists(os.path.join(ws2, ".team-solve", "agents", "plan.done"))
+    assert roles_run(tmp_path) == ["direct", "solve", "repair-1"]
+    assert "return a * b" in open(os.path.join(ws, "calc.py")).read()
+    res = json.load(open(ledger.state_path(ws, "run.json")))["result"]
+    assert res["keep"]["kept"] == "direct" and res["stopped"] == "max_iters"
+    rd = os.path.join(ws, res["run_dir"])
+    assert "return 1" in open(os.path.join(rd, "team.patch")).read()
+    # --verify-cmd fixed the Check whatever the planner said
+    assert "`python3 test_calc.py`" in tasklib.section(open(os.path.join(rd, "task.md")).read(), "Check")
 
 
-def test_agent_prompts_name_the_checker_and_starter_contract(tmp_path):
-    ws = make_ws(str(tmp_path))
-    open(os.path.join(ws, "tests", "func_name"), "w").write("f\n")
-    text = agents._context(ws, "task.md", "/x/team_solve.py")
-    assert "python3 /x/team_solve.py check --dir" in text and "`f`" in text
-    for role_name in agents.ROLES:
-        assert "{" not in prompts.AGENT_PROMPTS[role_name].format(task="task.md", run_id="r")
+CHECK_PY = """import os, sys
+fails = ["t.py::old"]
+if not (os.path.exists("feature.txt") and open("feature.txt").read().strip() == "yes"):
+    fails.append("t.py::feature")
+for f in fails:
+    print("FAILED " + f + " - boom")
+print(f"{len(fails)} failed, 3 passed in 0.01s")
+sys.exit(1)
+"""
 
 
-def test_agent_generic_prompts_and_context_name_the_command(tmp_path):
-    ws = make_ws(str(tmp_path))
-    text = agents._context(ws, "task.md", "/x/team_solve.py", verify_cmd="pytest -q")
-    assert "pytest -q" in text and "edit any file" in text
-    assert "python3 /x/team_solve.py check" not in text   # no sample-checker instruction
-    for role_name in agents.ROLES:
-        out = prompts.AGENT_PROMPTS_GENERIC[role_name].format(task="task.md", run_id="r", verify="pytest -q")
-        assert "{" not in out and "pytest -q" in out
-
-
-def test_agents_generic_mode_solves_via_command(tmp_path):
-    ws = make_ws(str(tmp_path / "p"))
-    env = dict(os.environ, CODEX_WORKSPACE_BIN=fake_codex(tmp_path), FAKE_FIRST=GOODCMD)
-    r = subprocess.run([sys.executable, CLI, "run", "--mode", "agents", "--dir", ws,
-                        "--verify-cmd", "python3 solution.py"],
-                       capture_output=True, text=True, env=env, timeout=120)
+def test_agents_baseline_counts_only_the_failures_the_change_adds(role_router, tmp_path):
+    ws = str(tmp_path / "proj")
+    os.makedirs(ws)
+    open(os.path.join(ws, "check.py"), "w").write(CHECK_PY)
+    RoleRouter.script = {"plan": plan_reply("`python3 check.py`", "`feature.txt`"), "review": ["verdict: PASS\nok"]}
+    env = agents_env(tmp_path, role_router, {"direct": [["feature.txt", "yes\n"]]})
+    r = cli(["Make the feature test pass by writing yes into feature.txt", "--dir", ws], env)
     assert r.returncode == 0, r.stderr
-    roles = open(os.path.join(ws, "roles.log")).read().split()
-    assert roles[0] == "plan" and set(roles[1:3]) == {"ideate-a", "ideate-b"} and roles[3:] == ["solve", "review", "repair"]
-    assert ledger.read(ws, "test-status.txt").strip() == "0"      # the command passed after solve
-    assert "exited 0" in ledger.read(ws, "final-test-output.log")
-    rec = json.load(open(ledger.state_path(ws, "run.json")))
-    assert rec["options"]["verify_cmd"] == "python3 solution.py"
+    res = json.load(open(ledger.state_path(ws, "run.json")))["result"]
+    rd = os.path.join(ws, res["run_dir"])
+    assert "2 failed" in open(os.path.join(rd, "baseline-check.log")).read()   # ran on the tree as found
+    assert "adds no failing test" in open(os.path.join(rd, "final-check.log")).read()
+    assert res["direct_passed"] and roles_run(tmp_path) == ["direct"]
+
+
+def test_agents_folder_task_md_with_samples(role_router, tmp_path):
+    ws = make_ws(str(tmp_path / "p"))
+    RoleRouter.script = {"plan": plan_reply("samples", "`solution.py`"), "review": ["verdict: PASS"]}
+    env = agents_env(tmp_path, role_router, {"direct": [["solution.py", GOOD + "\n"]]})
+    r = cli(["run", "--mode", "agents", "--dir", ws], env)
+    assert r.returncode == 0, r.stderr
+    assert "Samples: 2; failures: 0" in r.stdout
+    assert [n for n, _ in RoleRouter.seen] == ["plan", "review"]          # the samples decide: no judge
+    assert "Add two numbers." in RoleRouter.seen[0][1]                     # task.md was the prompt
+
+
+def test_agents_resumes_an_unfinished_run_without_redoing_steps(role_router, tmp_path):
+    ws = git_repo(str(tmp_path / "repo"), {"calc.py": "def add(a, b):\n    return a - b\n", "test_calc.py": CALC_TEST})
+    RoleRouter.script = {"plan": plan_reply("`python3 test_calc.py`", "`calc.py`"), "ideate": "x\nx\nx\nx\nx",
+                         "review": ["verdict: PASS"]}
+    first = {"direct": [["calc.py", "def add(a, b):\n    return a * b\n"]], "fail:solve": 3}
+    env = agents_env(tmp_path, role_router, first)
+    r = cli(["Fix add in calc.py", "--dir", ws], env)
+    assert r.returncode == 2 and "agent step 'solve' failed" in r.stderr
+    assert roles_run(tmp_path) == ["direct", "solve", "solve"]             # one fresh retry
+    live_before = len(RoleRouter.seen)
+    env = agents_env(tmp_path, role_router, {"solve": [["calc.py", "def add(a, b):\n    return a + b\n"]]})
+    r = cli(["Fix add in calc.py", "--dir", ws], env)
+    assert r.returncode == 0, r.stderr
+    assert "resuming run" in r.stderr
+    assert roles_run(tmp_path) == ["direct", "solve", "solve", "solve"]   # direct not redone
+    assert [n for n, _ in RoleRouter.seen[live_before:]] == ["review"]     # plan and ideators replayed
+    assert json.load(open(ledger.state_path(ws, "run.json")))["result"]["resumed"] is True
+
+
+def test_agents_turn_without_its_target_is_resumed_in_its_session(role_router, tmp_path):
+    ws = git_repo(str(tmp_path / "repo"), {"calc.py": "def add(a, b):\n    return a - b\n", "test_calc.py": CALC_TEST})
+    RoleRouter.script = {"plan": plan_reply("`python3 test_calc.py`", "`calc.py`"), "ideate": "x\nx\nx\nx\nx",
+                         "review": ["verdict: PASS"]}
+    env = agents_env(tmp_path, role_router, {"solve:resume": [["calc.py", "def add(a, b):\n    return a + b\n"]]})
+    r = cli(["Fix add in calc.py", "--dir", ws], env)
+    assert r.returncode == 0, r.stderr
+    assert roles_run(tmp_path) == ["direct", "solve", "solve:resume"]
+
+
+def test_cli_prompt_implies_run_and_until_refuses_loop(tmp_path):
+    ws = make_ws(str(tmp_path))
+    env = dict(os.environ, TEAM_SOLVE_BASE_URL="http://127.0.0.1:9/v1", TEAM_SOLVE_API_KEY="t")
+    r = cli(["do the thing", "--dir", ws], env)
+    assert r.returncode == 2 and "router not reachable" in r.stderr       # parsed as `run`, agents mode
+    r = cli(["run", "--mode", "loop", "--until", "it works", "--dir", ws], env)
+    assert r.returncode == 2 and "--until needs --mode agents" in r.stderr
+    empty = str(tmp_path / "empty")
+    os.makedirs(empty)
+    r = cli(["run", "--dir", empty], env)
+    assert r.returncode == 2 and "no task" in r.stderr
+
+
+def test_pick_mode():
+    import team_solve
+    ns = lambda **k: SimpleNamespace(**dict(dict(mode="auto", until=None, spec="code", verify_cmd=None), **k))  # noqa: E731
+    with tempfile.TemporaryDirectory() as d:
+        assert team_solve.pick_mode(ns(), d, "fix it") == "agents"
+        assert team_solve.pick_mode(ns(until="x"), d, "") == "agents"
+        assert team_solve.pick_mode(ns(), d, "") == "agents"              # nothing a loop could check
+        assert team_solve.pick_mode(ns(verify_cmd="make"), d, "") == "loop"
+        make_ws(d)
+        assert team_solve.pick_mode(ns(), d, "") == "loop"                # samples: the benchmarked loop
+        assert team_solve.pick_mode(ns(mode="agents"), d, "") == "agents"
+
+
+# --- agents mode: the parts on their own ---------------------------------------------------
+
+def test_failures_parse_runners():
+    py = "FAILED a.py::t1 - x\nERROR b.py::t2\n1 failed, 1 error, 3 passed in 0.2s\n"
+    assert failures.parse(py) == ["a.py::t1", "b.py::t2"]
+    assert failures.parse("FAILED a.py::t1\n2 failed in 0.1s\n") is None          # count mismatch: unknown
+    ut = "FAIL: test_a (m.C)\nERROR: test_b (m.C)\nRan 4 tests in 0.1s\n\nFAILED (failures=1, errors=1)\n"
+    assert failures.parse(ut) == ["test_a (m.C)", "test_b (m.C)"]
+    go = "--- FAIL: TestX (0.00s)\nFAIL\texample.com/p\t0.01s\nok  \texample.com/q\t0.02s\n"
+    assert failures.parse(go) == ["TestX", "package example.com/p"]
+    assert failures.parse("Traceback...\nAssertionError\n") is None                # not a runner's log
+    assert failures.parse("3 passed in 0.1s\n") is None                            # names no failure
+
+
+def test_task_template_settle_and_check_spec(tmp_path):
+    ws = str(tmp_path)
+    os.makedirs(os.path.join(ws, "pkg"))
+    open(os.path.join(ws, "pkg", "x.go"), "w").write("")
+    prompt = tasklib.prompt_text("## Goal\nRename it in pkg/x.go. Check: go test ./pkg/ passes.", "it builds")
+    task = tasklib.make_task(prompt)
+    assert "### Goal" in task and tasklib.section(task, "Prompt").startswith("### Goal")
+    # a plan with nothing usable: every section filled safely
+    text, filled = tasklib.settle("## Approach\nhmm", task, prompt, ws, until="it builds")
+    assert set(filled) == {"Deliverable", "Check", "Scope"}
+    assert tasklib.section(text, "Check") == "`go test ./pkg/`"                     # the prompt named it
+    assert tasklib.scope_entries(text) == ["pkg", "pkg/x.go"]                       # paths the prompt names
+    assert tasklib.section(text, "Done when") == "- it builds"
+    assert tasklib.check_spec(text, ws) == ("command", "go test ./pkg/")
+    assert tasklib.section(text, "Prompt") == tasklib.section(task, "Prompt")       # untouched
+    # --verify-cmd wins over the planner; the end condition is first and not repeated
+    plan = plan_reply("`make`", "`pkg/`", "- it builds\n- (inferred) docs")
+    text, _ = tasklib.settle(plan, task, prompt, ws, until="it builds", verify_cmd="go vet ./...")
+    assert tasklib.check_spec(text, ws) == ("command", "go vet ./...")
+    assert tasklib.section(text, "Done when") == "- it builds\n- (inferred) docs"
+    assert tasklib.scope_entries(text) == ["pkg"]
+    assert tasklib.check_spec(tasklib.settle(plan_reply("judge (nothing runs)", "`.`"), task, "x", ws)[0], ws) == ("judge", "")
+    make_ws(ws)
+    assert tasklib.check_spec(tasklib.settle(plan_reply("samples", "`.`"), task, "x", ws)[0], ws) == ("samples", "")
+    assert tasklib.prompt_check("Check: `npm test` exits 0") == "npm test"
+
+
+@pytest.mark.parametrize("repo", [True, False])
+def test_tree_states_round_trip(tmp_path, repo):
+    ws = str(tmp_path / "w")
+    files = {"a.txt": "a\n", "b.txt": "b\n"}
+    if repo:
+        git_repo(ws, files)
+    else:
+        os.makedirs(ws)
+        for k, v in files.items():
+            open(os.path.join(ws, k), "w").write(v)
+    open(os.path.join(ws, "pre.txt"), "w").write("untracked before\n")
+    rd = str(tmp_path / "rd")
+    os.makedirs(rd)
+    ledger.ensure_state_dir(ws)
+    t = gitstate.Tree(ws, rd, "r1", lambda *a: None)
+    assert t.real is repo
+    t.start()
+    open(os.path.join(ws, "a.txt"), "w").write("A\n")
+    os.unlink(os.path.join(ws, "b.txt"))
+    open(os.path.join(ws, "pre.txt"), "w").write("edited\n")
+    os.makedirs(os.path.join(ws, "new"))
+    open(os.path.join(ws, "new", "c.bin"), "wb").write(b"\x00\x01\x02")
+    open(os.path.join(ws, ".team-solve", "noise"), "w").write("never part of it")
+    changed = {p for _, _, p in t.changed_files()}
+    assert changed == {"a.txt", "b.txt", "pre.txt", "new/c.bin"}
+    diff = t.changes()
+    assert "+edited" in diff and "noise" not in diff
+    t.save("mid")
+    t.restore_tree(t.base)
+    assert open(os.path.join(ws, "a.txt")).read() == "a\n" and os.path.exists(os.path.join(ws, "b.txt"))
+    assert open(os.path.join(ws, "pre.txt")).read() == "untracked before\n" and not os.path.exists(os.path.join(ws, "new"))
+    assert os.path.exists(os.path.join(ws, ".team-solve", "noise"))
+    t.restore("mid")
+    assert open(os.path.join(ws, "new", "c.bin"), "rb").read() == b"\x00\x01\x02"
+    assert not os.path.exists(os.path.join(ws, "b.txt")) and open(os.path.join(ws, "pre.txt")).read() == "edited\n"
+    if repo:
+        assert subprocess.run(["git", "status", "--porcelain", "--", ".team-solve"], cwd=ws,
+                              capture_output=True, text=True).stdout == ""
+        assert t.restore_head() == ""
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "two"],
+                       cwd=ws, check=True)
+        subprocess.run(["git", "checkout", "-q", "HEAD~1"], cwd=ws, check=True, capture_output=True)   # a role moved it
+        assert "put back" in t.restore_head()
+        assert subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=ws, capture_output=True, text=True).returncode == 0
+
+
+def test_calls_chat_many_runs_side_by_side_and_replays_in_order(tmp_path):
+    class Slow:
+        def __init__(self):
+            self.live, self.active, self.peak = 0, 0, 0
+            self.mutex = threading.Lock()
+
+        def params(self):
+            return {"model": "slow"}
+
+        def chat(self, messages, temperature):
+            import time
+            with self.mutex:
+                self.live += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            time.sleep(0.2)
+            with self.mutex:
+                self.active -= 1
+            return client.Reply("re: " + messages[0]["content"], "stop")
+    items = [("x-a", [{"role": "user", "content": "A"}], 0.4), ("x-b", [{"role": "user", "content": "B"}], 0.4)]
+    sc = Slow()
+    reps = ledger.Calls(str(tmp_path), sc, lambda *a: None, state=str(tmp_path / "st")).chat_many(items)
+    assert [r.text for r in reps] == ["re: A", "re: B"] and sc.peak == 2
+    assert sorted(os.listdir(tmp_path / "st" / "calls")) == ["001-x-a.json", "002-x-b.json"]
+    sc2 = Slow()
+    calls = ledger.Calls(str(tmp_path), sc2, lambda *a: None, state=str(tmp_path / "st"))
+    assert [r.text for r in calls.chat_many(items)] == ["re: A", "re: B"] and sc2.live == 0 and calls.replayed == 2
+
+
+def test_verdict_of():
+    assert pipeline.verdict_of("**verdict: PASS**\nfine") == "PASS"
+    assert pipeline.verdict_of("Let me look.\n`verdict: FAIL`") == "FAIL"
+    assert pipeline.verdict_of("Let me inspect the diff first...") == "none"
+    assert pipeline.verdict_of("\n" * 12 + "verdict: PASS") == "none"
+
+
+def test_agent_prompts_have_no_unfilled_fields():
+    for text in (prompts.solve_prompt(".team-solve/runs/r"), prompts.repair_prompt(".team-solve/runs/r", 2, True),
+                 prompts.direct_prompt("do x"), prompts.plan_user("o", "u", "make"),
+                 prompts.review_user("t", "d", "l", "0", 1), prompts.judge_user("t", "d", "log"),
+                 prompts.ideate_user_agents("c", "a"), prompts.ideate_user_agents("c", "b")):
+        assert "{" not in text.replace("{len", "")
+    assert "verdict.md" in prompts.repair_prompt("r", 1, True) and "verdict.md" not in prompts.repair_prompt("r", 1, False)
+    assert "could not decide" in prompts.judge_user("t", "d", "log") and "Check printed" not in prompts.judge_user("t", "d")

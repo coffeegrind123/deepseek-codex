@@ -31,7 +31,9 @@ if [[ "${1:-}" == "ovis" ]]; then
 fi
 
 # ./codex team-solve [args]: the team-solve skill's runner (.codex/skills/team-solve) instead
-# of the Codex TUI, with the same router, secrets and cage. --dir DIR is its work folder.
+# of the Codex TUI, with the same router, secrets and cage. --dir DIR is its work folder
+# (default: the current folder). `./codex team-solve "what to do" [--until "end condition"]`
+# runs a task from a prompt in that folder.
 TEAM_SOLVE=0
 if [[ "${1:-}" == "team-solve" ]]; then
   TEAM_SOLVE=1
@@ -155,7 +157,12 @@ if (( TEAM_SOLVE )); then
   # resolve against the folder we just cd'd into.
   export CODEX_WORKSPACE_BIN="$BIN"
   ts_args=("$@")
-  case "${1:-}" in run|check|status) ts_args+=(--dir "$work") ;; esac
+  # `./codex team-solve "do this" [--until "..."]` is `run`: the prompt is the task.
+  case "${1:-}" in
+    run|check|status) ts_args+=(--dir "$work") ;;
+    -h|--help|"") ;;
+    *) ts_args=(run "${ts_args[@]}" --dir "$work") ;;
+  esac
   exec python3 "$CAGE" "${cage_args[@]}" -- \
     python3 "$ROOT/.codex/skills/team-solve/scripts/team_solve.py" "${ts_args[@]}"
 fi

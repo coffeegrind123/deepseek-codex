@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import time
 
 STATE_DIR = ".team-solve"
@@ -51,9 +52,21 @@ def state_path(ws, *parts):
     return os.path.join(ws, STATE_DIR, *parts)
 
 
+def ensure_state_dir(ws):
+    """.team-solve/ with a .gitignore of '*', so a run inside a repository never shows up in
+    `git status` and never lands in the run's own diff."""
+    d = state_path(ws)
+    os.makedirs(d, exist_ok=True)
+    gi = os.path.join(d, ".gitignore")
+    if not os.path.exists(gi):
+        with open(gi, "w") as f:
+            f.write("*\n")
+    return d
+
+
 class Lock:
     def __init__(self, ws):
-        os.makedirs(state_path(ws), exist_ok=True)
+        ensure_state_dir(ws)
         self.path = state_path(ws, "lock")
         self.fd = None
 
@@ -80,21 +93,30 @@ def _key(messages, temperature, params):
 
 
 class Calls:
-    """Replay cache + meter + transcript around a client (anything with .chat and .params)."""
+    """Replay cache + meter + transcript around a client (anything with .chat and .params).
 
-    def __init__(self, ws, client, log, replay=True):
+    `state` is the folder that holds calls/, meter.jsonl and transcript.jsonl: the problem
+    folder's .team-solve/ by default, a prompt run's own folder in agents mode."""
+
+    def __init__(self, ws, client, log, replay=True, state=None):
         self.ws, self.client, self.log = ws, client, log
+        self.state = state or state_path(ws)
         self.replay = replay
         self.n = 0
         self.live = 0
         self.replayed = 0
         self.diverged = False
         self.tokens = {"input": 0, "output": 0, "reasoning": 0, "cached": 0}
-        os.makedirs(state_path(ws, "calls"), exist_ok=True)
-        write(ws, os.path.join(STATE_DIR, "transcript.jsonl"), "")
+        os.makedirs(self._p("calls"), exist_ok=True)
+        with open(self._p("transcript.jsonl"), "w"):
+            pass
+        self.mutex = threading.Lock()
+
+    def _p(self, *parts):
+        return os.path.join(self.state, *parts)
 
     def _slots(self):
-        d = state_path(self.ws, "calls")
+        d = self._p("calls")
         return sorted(f for f in os.listdir(d) if f.endswith(".json"))
 
     def _retire_from(self, index):
@@ -102,56 +124,101 @@ class Calls:
         stale = [f for f in self._slots() if int(f.split("-", 1)[0]) >= index]
         if not stale:
             return
-        dest = state_path(self.ws, "stale", time.strftime("%Y%m%d-%H%M%S"))
+        dest = self._p("stale", time.strftime("%Y%m%d-%H%M%S"))
         os.makedirs(dest, exist_ok=True)
         for f in stale:
-            shutil.move(state_path(self.ws, "calls", f), os.path.join(dest, f))
+            shutil.move(self._p("calls", f), os.path.join(dest, f))
         self.log(f"    [replay] request changed at call {index}; {len(stale)} later call(s) moved to "
                  f"{os.path.relpath(dest, self.ws)}")
 
-    def chat(self, name, messages, temperature):
+    def _claim(self, name, messages, temperature):
+        """Allocate the next slot; return (slot, key, replayed reply or None)."""
         from .client import Reply  # local: client imports nothing from here
         self.n += 1
         slot = f"{self.n:03d}-{name}.json"
-        path = state_path(self.ws, "calls", slot)
+        path = self._p("calls", slot)
         key = _key(messages, temperature, self.client.params())
-        reply = None
         if self.replay and not self.diverged and os.path.exists(path):
             rec = json.load(open(path))
             if rec.get("key") == key and not rec["reply"].get("infra_exhausted"):
-                reply = Reply.from_json(rec["reply"])
                 self.replayed += 1
-        if reply is None:
-            if not self.diverged:
-                self._retire_from(self.n)
-                self.diverged = True
-            reply = self.client.chat(messages, temperature)
-            self.live += 1
-            rec = {"name": name, "key": key, "t": time.time(), "temperature": temperature,
-                   "params": self.client.params(), "request": messages, "reply": reply.to_json()}
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(rec, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, path)
-            u = reply.usage or {}
-            with open(state_path(self.ws, "meter.jsonl"), "a") as f:
-                f.write(json.dumps({"t": time.time(), "call": slot[:-5], "model": reply.model,
-                                    "finish": reply.finish, "attempts": reply.attempts, "ms": reply.ms,
-                                    "input_tokens": u.get("input_tokens"),
-                                    "cached_tokens": (u.get("input_tokens_details") or {}).get("cached_tokens"),
-                                    "output_tokens": u.get("output_tokens"),
-                                    "reasoning_tokens": (u.get("output_tokens_details") or {}).get("reasoning_tokens"),
-                                    "infra_exhausted": reply.infra_exhausted}) + "\n")
+                return slot, key, Reply.from_json(rec["reply"])
+        if not self.diverged:
+            self._retire_from(self.n)
+            self.diverged = True
+        return slot, key, None
+
+    def _record(self, slot, name, key, messages, temperature, reply):
+        path = self._p("calls", slot)
+        rec = {"name": name, "key": key, "t": time.time(), "temperature": temperature,
+               "params": self.client.params(), "request": messages, "reply": reply.to_json()}
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rec, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        u = reply.usage or {}
+        with open(self._p("meter.jsonl"), "a") as f:
+            f.write(json.dumps({"t": time.time(), "call": slot[:-5], "model": reply.model,
+                                "finish": reply.finish, "attempts": reply.attempts, "ms": reply.ms,
+                                "input_tokens": u.get("input_tokens"),
+                                "cached_tokens": (u.get("input_tokens_details") or {}).get("cached_tokens"),
+                                "output_tokens": u.get("output_tokens"),
+                                "reasoning_tokens": (u.get("output_tokens_details") or {}).get("reasoning_tokens"),
+                                "infra_exhausted": reply.infra_exhausted}) + "\n")
+
+    def _account(self, name, messages, reply, replayed):
         u = reply.usage or {}
         self.tokens["input"] += u.get("input_tokens") or 0
         self.tokens["output"] += u.get("output_tokens") or 0
         self.tokens["cached"] += (u.get("input_tokens_details") or {}).get("cached_tokens") or 0
         self.tokens["reasoning"] += (u.get("output_tokens_details") or {}).get("reasoning_tokens") or 0
-        with open(state_path(self.ws, "transcript.jsonl"), "a") as f:
+        with open(self._p("transcript.jsonl"), "a") as f:
             f.write(json.dumps({"t": time.time(), "role": name, "request": messages, "response": reply.text,
                                 "reasoning": reply.reasoning, "finish_reason": reply.finish,
                                 "completion_tokens": u.get("output_tokens"), "prompt_tokens": u.get("input_tokens"),
                                 "attempts": reply.attempts, "discarded": reply.discarded,
-                                "infra_exhausted": reply.infra_exhausted, "replayed": not self.diverged},
+                                "infra_exhausted": reply.infra_exhausted, "replayed": replayed},
                                ensure_ascii=False) + "\n")
+
+    def chat(self, name, messages, temperature):
+        with self.mutex:
+            slot, key, reply = self._claim(name, messages, temperature)
+        replayed = reply is not None
+        if reply is None:
+            reply = self.client.chat(messages, temperature)
+            with self.mutex:
+                self.live += 1
+                self._record(slot, name, key, messages, temperature, reply)
+        with self.mutex:
+            self._account(name, messages, reply, replayed)
         return reply
+
+    def chat_many(self, items):
+        """Several independent calls at once: [(name, messages, temperature), ...] -> replies in
+        order. Slots are claimed in order before any call runs, so replay stays deterministic
+        while the live calls run side by side (memdoor's `each: [a, b]` ideators)."""
+        with self.mutex:
+            claims = [self._claim(*it) for it in items]
+        replies = [c[2] for c in claims]
+        errors = []
+
+        def go(i):
+            try:
+                replies[i] = self.client.chat(items[i][1], items[i][2])
+            except Exception as e:  # noqa: BLE001 -- re-raised below on the caller's thread
+                errors.append(e)
+        live = [i for i, c in enumerate(claims) if c[2] is None]
+        threads = [threading.Thread(target=go, args=(i,)) for i in live]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+        with self.mutex:
+            for i in live:
+                self.live += 1
+                self._record(claims[i][0], items[i][0], claims[i][1], items[i][1], items[i][2], replies[i])
+            for i, it in enumerate(items):
+                self._account(it[0], it[1], replies[i], i not in live)
+        return replies

@@ -156,6 +156,7 @@ done
 printf '== skills (in this repo)\n'
 [[ -f "$ROOT/.codex/skills/team-solve/SKILL.md" ]] || die "$ROOT/.codex/skills/team-solve/SKILL.md missing"
 python3 -m py_compile "$ROOT/.codex/skills/team-solve/scripts/team_solve.py" \
+  "$ROOT"/.codex/skills/team-solve/scripts/teamsolve/*.py \
   || die "team-solve runner does not compile"
 ok "team-solve"
 

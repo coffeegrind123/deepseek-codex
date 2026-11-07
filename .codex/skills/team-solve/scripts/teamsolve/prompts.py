@@ -5,8 +5,9 @@ and orchestrator.py at b4cc2f7, MIT). They are copied verbatim on purpose:
 tests/test_team_solve_parity.py runs the authors' code and ours against one scripted
 model and fails on a single changed byte. Edit them only together with that test.
 
-Agent-mode prompts are memdoor's examples/workflows/team-solve/steps/*.yaml (Apache-2.0),
-with the memdoor-specific paths replaced by this skill's checker.
+Agent-mode prompts are memdoor's workflows/team-solve/steps/*.yaml at 47dad8b (Apache-2.0),
+with memdoor's run folder and tools replaced by this skill's (.team-solve/runs/<id>/, codex
+exec roles), and the review/repair pair made a loop of rounds instead of one repair.
 """
 
 # --- task specs (orchestrator.py) ---------------------------------------------
@@ -232,162 +233,164 @@ def stress_user(problem, feedback=""):
     return u
 
 
-# --- agent mode (memdoor steps/*.yaml) ------------------------------------------
 
-AGENT_PROMPTS = {
-    "plan": (
-        "You are the planner in a ledger-based team with fresh contexts. Read {task} "
-        "from disk. Write plan.md with the decomposition, correctness requirements, "
-        "two or three candidate algorithms and their time/space complexity, and "
-        "instructions for independent ideators, solver, and reviewer. Do not solve "
-        "by changing {task} or tests. Initialize notes.md for THIS run, with a title, "
-        "the run identifier {run_id}, and separate headings for Proposal A, "
-        "Proposal B, Solver decision, Review, and Repair. Include unique literal "
-        "markers <!-- proposal-a --> and <!-- proposal-b --> under their headings. "
-        "Reserve enough blank lines in these sections that notes.md is at least 50 "
-        "lines long. Parallel workers will insert at distinct markers using small "
-        "patches, never overwrite the ledger. Verify both files exist and that both "
-        "markers occur exactly once. Communicate only through these on-disk files; "
-        "do not rely on prior conversation or delegate agents yourself."
-    ),
-    "ideate-a": (
-        "You are independent ideator A in a fresh context. Read {task}, plan.md, "
-        "and the current notes.md. Develop one concrete proposal: the most direct "
-        "algorithm you can prove meets the stated constraints. Include pseudocode, "
-        "the invariant, correctness reasoning, complexity, and edge cases. Append "
-        "your proposal to the Proposal A section of notes.md by an apply_patch "
-        "insertion immediately before its unique <!-- proposal-a --> marker. Keep "
-        "the marker and every other line intact: the other ideator writes concurrently "
-        "to a distinct section. Never rewrite notes.md or modify solution.py. Re-read "
-        "and retry a minimal insertion if the shared ledger changed. Verify your "
-        "proposal is on disk. Do not spawn other agents or rely on chat context."
-    ),
-    "ideate-b": (
-        "You are independent ideator B in a fresh context. Read {task}, plan.md, "
-        "and the current notes.md. Develop one concrete alternative proposal from a "
-        "different family of technique than the most obvious one (if the obvious "
-        "approach is dynamic programming, try greedy, math, or a data structure, and "
-        "so on), and compare its tradeoffs with the obvious approach. Include "
-        "pseudocode, correctness reasoning, complexity, and off-by-one/overflow "
-        "checks. Append your proposal to the Proposal B section of notes.md by an "
-        "apply_patch insertion immediately before its unique <!-- proposal-b --> "
-        "marker. Keep the marker and all other lines intact: the other ideator "
-        "writes concurrently to a distinct section. Never rewrite notes.md or modify "
-        "solution.py. Re-read and retry a minimal insertion if the shared ledger "
-        "changed. Verify your proposal is on disk. Do not spawn other agents or rely "
-        "on chat context."
-    ),
-    "solve": (
-        "You are the solver in a fresh context. Read {task}, plan.md, and notes.md "
-        "from disk, including both proposals. Select and justify an approach in the "
-        "Solver decision section of notes.md, with a brief correctness argument and "
-        "complexity. Write the complete solution.py using Python's standard library, "
-        "reading stdin and printing only the answer. Meet the stated constraints. "
-        "Run solution.py on at least one sample to verify it executes. Do not change "
-        "the problem or sample tests. The downstream command runs all samples and "
-        "the manager owns any repair round. Do not spawn agents or use chat context."
-    ),
-    "review": (
-        "You are the manager/reviewer in a fresh context. Read {task}, notes.md, "
-        "solution.py, test-status.txt, and test-output.log from disk. Inspect the "
-        "actual captured results, not a previous agent's claims. Write review.md "
-        "describing the result and append the review to notes.md. If the status "
-        "is nonzero, analyze failing samples and append concrete repair instructions "
-        "to notes.md for the next fresh worker. Do not change solution.py yourself. "
-        "If it is zero, record that no repair is needed. Do not alter test data or "
-        "bypass comparison failures. Verify the review is on disk. There is exactly "
-        "one conditional repair round followed by a mandatory strict test command; "
-        "do not claim overall completion before that final command passes."
-    ),
-    "repair": (
-        "You are the single repair worker in a fresh context. Read test-status.txt, "
-        "review.md, and notes.md from disk. If the initial test status is zero, "
-        "leave solution.py unchanged and report that repair was unnecessary. "
-        "Otherwise read {task}, plan.md, solution.py, test-output.log, and the "
-        "relevant samples, then correct solution.py using the manager's instructions. "
-        "Append a concise repair explanation to notes.md. Run solution.py on a "
-        "failing sample to verify the change, but do not start another repair round "
-        "or change any test inputs/expected outputs. The next strict command alone "
-        "determines workflow success. Do not spawn agents or rely on chat history."
-    ),
-}
 
-# Agent mode under a custom --verify-cmd: the task is any command-checkable change to the
-# whole workspace, not a contest solution. Same ledger discipline and the same DAG; the
-# roles edit whatever files the task needs and the verification command is the ground
-# truth. {task} is the task file, {run_id} the run, {verify} the exact command.
-AGENT_PROMPTS_GENERIC = {
-    "plan": (
-        "You are the planner in a ledger-based team with fresh contexts. Read {task} from "
-        "disk and inspect the workspace. The task is complete only when this command exits "
-        "zero:\n    {verify}\nWrite plan.md with the decomposition, the files and components "
-        "involved, the correctness requirements the command encodes, two or three candidate "
-        "approaches, and instructions for the independent ideators, the solver, and the "
-        "reviewer. Do not edit {task} or the verification command, and do not weaken the "
-        "check. Initialize notes.md for THIS run, with a title, the run identifier {run_id}, "
-        "and separate headings for Proposal A, Proposal B, Solver decision, Review, and "
-        "Repair, with unique literal markers <!-- proposal-a --> and <!-- proposal-b --> "
-        "under their headings. Reserve enough blank lines that notes.md is at least 50 lines "
-        "long. Parallel workers insert at distinct markers with small patches, never "
-        "overwrite the ledger. Verify both files exist and both markers occur exactly once. "
-        "Communicate only through these on-disk files; do not rely on prior conversation or "
-        "delegate agents yourself."
-    ),
-    "ideate-a": (
-        "You are independent ideator A in a fresh context. Read {task}, plan.md, the current "
-        "notes.md, and the relevant workspace files. Develop one concrete proposal: the most "
-        "direct way to make `{verify}` pass that you can argue is correct. Name the files to "
-        "change and how, the key steps, and the edge cases the command checks. Append your "
-        "proposal to the Proposal A section of notes.md by an apply_patch insertion "
-        "immediately before its unique <!-- proposal-a --> marker. Keep the marker and every "
-        "other line intact: the other ideator writes concurrently to a distinct section. Do "
-        "not rewrite notes.md and do not change the solution yet. Re-read and retry a minimal "
-        "insertion if the shared ledger changed. Verify your proposal is on disk. Do not spawn "
-        "other agents or rely on chat context."
-    ),
-    "ideate-b": (
-        "You are independent ideator B in a fresh context. Read {task}, plan.md, the current "
-        "notes.md, and the relevant workspace files. Develop one concrete alternative to make "
-        "`{verify}` pass from a different angle than the most obvious one (a different design, "
-        "data flow, or library), and compare its tradeoffs with the obvious approach. Name the "
-        "files to change, the key steps, and the risks. Append your proposal to the Proposal B "
-        "section of notes.md by an apply_patch insertion immediately before its unique "
-        "<!-- proposal-b --> marker. Keep the marker and all other lines intact: the other "
-        "ideator writes concurrently to a distinct section. Do not rewrite notes.md and do not "
-        "change the solution yet. Re-read and retry a minimal insertion if the shared ledger "
-        "changed. Verify your proposal is on disk. Do not spawn other agents or rely on chat "
-        "context."
-    ),
-    "solve": (
-        "You are the solver in a fresh context. Read {task}, plan.md, and notes.md from disk, "
-        "including both proposals, and inspect the workspace. Select and justify an approach "
-        "in the Solver decision section of notes.md. Then make the change: edit whatever files "
-        "the task needs so that `{verify}` passes. Run the verification command yourself and "
-        "iterate until it exits zero, or until you have gone as far as you can; record what "
-        "happened. Do not edit {task} or the verification command, and do not weaken the "
-        "check. The downstream command runs {verify} again and the manager owns any repair "
-        "round. Do not spawn agents or use chat context."
-    ),
-    "review": (
-        "You are the manager/reviewer in a fresh context. Read {task}, notes.md, "
-        "test-status.txt and test-output.log from disk, and inspect the files the solver "
-        "changed. Inspect the actual captured result of `{verify}`, not a previous agent's "
-        "claims. Write review.md describing the result and append the review to notes.md. If "
-        "the status is nonzero, analyze the failure and append concrete repair instructions "
-        "to notes.md for the next fresh worker. Do not change the solution yourself. If it is "
-        "zero, record that no repair is needed. Do not alter the task or the verification "
-        "command or bypass the failure. Verify the review is on disk. There is exactly one "
-        "conditional repair round followed by a mandatory strict run of the command; do not "
-        "claim completion before that final run passes."
-    ),
-    "repair": (
-        "You are the single repair worker in a fresh context. Read test-status.txt, review.md "
-        "and notes.md from disk. If the initial test status is zero, change nothing and report "
-        "that repair was unnecessary. Otherwise read {task}, plan.md, test-output.log and the "
-        "files involved, then correct the workspace using the manager's instructions so that "
-        "`{verify}` passes. Append a concise repair explanation to notes.md. Run the command "
-        "to verify your change, but do not start another repair round and do not edit {task} "
-        "or the verification command. The next strict run of the command alone determines "
-        "success. Do not spawn agents or rely on chat history."
-    ),
-}
+# --- agent mode: a task from a prompt (memdoor workflows/team-solve/steps/*.yaml) --------
+#
+# The planner, the ideators, the reviewer and the judge are one router call each with no
+# tools: they read what the harness gathered and answer. Only direct, solve and repair are
+# Codex agent turns that change the tree. {rd} is the run folder relative to the project.
+
+def no_tools_system(first_line):
+    return ("You answer in this one message. You have no tools: you cannot open a file, list a "
+            "directory or run a command, and nothing you write will be run. Everything you need is in "
+            f"the message. Do not say what you will look at: answer. Start your answer with the line {first_line}.")
+
+
+PLAN_FIRST = "## Deliverable"
+VERDICT_FIRST = "verdict: PASS or verdict: FAIL"
+
+
+def plan_user(outline, until=None, verify_cmd=None):
+    given = ""
+    if until:
+        given += ("\n\nThe person gave the end condition at the end of the prompt. It is the first line of "
+                  "Done when, word for word; the run is done only when it holds.")
+    if verify_cmd:
+        given += (f"\n\nThe person fixed the Check: `{verify_cmd}`. Write it as the Check, in backticks, "
+                  "unchanged.")
+    return f"""{outline}
+
+You are the planner of a team that does the task in the prompt above, in this project. Settle what the work is checked against. Answer with exactly these five sections, in this order, and nothing before them:
+
+## Deliverable
+"changes to this tree" when the task changes the project; or the new files by name (a program: solution.py, Python standard library only, stdin in, the answer alone on stdout; a document: answer.md).
+
+## Check
+One command in backticks that exits 0 when the work is right: the one the prompt names when it names one, else the project's own (`go test ./pkg/x/`, `npm test`, `make check`), scoped to what the task touches. The word samples when tests/N.in and tests/N.out are in the files above. The word judge when nothing can be run. A command must be one that can pass on a correct result in this project as it is: never a command that needs a network service, a credential or a tool the files above do not show.
+
+## Scope
+Each file or directory the work may touch, in backticks, one per line (`scripts/scan.sh`, `docs/`). What the prompt allows is the Scope: when it says "files under cmd/cli/cmd/ only", the Scope is `cmd/cli/cmd/`. A new file whose name the prompt does not give (a test to add, a page to write) is covered by its directory, never by a name you guess. `.` only when the task is the whole tree.
+
+## Done when
+What the reviewer and the judge check, one line each, each a thing the prompt asks for, in the prompt's terms. Nothing the prompt does not ask: not the project's conventions (a changelog entry, docs, a release note), not a test of the shape you would write, not a wording the prompt does not give. A line you infer because the prompt is unclear starts with `(inferred)`.
+
+## Approach
+The decomposition, and two or three candidate approaches with their tradeoffs, for the solver if the first attempt fails.{given}"""
+
+
+def ideate_user_agents(context, which):
+    if which == "a":
+        mine = "the most direct approach you can argue meets every line of Done when."
+    else:
+        mine = ("an alternative from a different family than the obvious approach (a program: if the obvious "
+                "one is dynamic programming, try greedy, math or a data structure; a change to a codebase: a "
+                "different place to cut, a different sequence of steps; a document: a different structure or "
+                "angle), with its tradeoffs against the obvious one.")
+    return f"""{context}
+
+You are independent ideator {which.upper()} on the task above: task.md is the task, plan.md the planner's decomposition, and the files after them are the ones the Scope names, as they are now. The first attempt, its diff and what the Check said of it close the message. Another ideator writes a proposal at the same time; a solver then does the work from the two.
+
+Your proposal: {mine}
+
+For a program: pseudocode, the invariant, correctness, complexity, edge cases. For a change to a codebase: the files and the edits in order (the lines as they are now and as they should be), what could break and how the Check will show it. For a document: the outline, the claims and what backs each. Stay within the Scope and change nothing the task did not ask for.
+
+Answer with the proposal alone, in markdown, five lines at least."""
+
+
+def review_user(task, diff, check_log, status, round_no):
+    return f"""# The task
+
+{task}
+
+# What the run changed (a unified diff; new files in full)
+
+```diff
+{diff}
+```
+
+# What the Check printed, and the Scope report
+
+```
+{check_log}
+```
+
+Check status: {status} (0 passed, 1 failed, none: nothing could be run). Review round {round_no}.
+
+You are the reviewer. Judge the change above against the task's Done when, from this evidence alone. The verdict is on the work, not on what it says of itself: a review or an audit the task asked for passes when its findings are true and grounded.
+
+The task's Prompt is what the person asked; Done when is the planner's reading of it. Fail only on what the Prompt asks for. A line of Done when that starts with (inferred), or that asks for what the Prompt does not (a changelog entry, docs, a test of a given shape, a wording the Prompt does not give), is a note in the findings, never a reason to FAIL. An end condition the person wrote into the Prompt is binding: FAIL while it does not hold.
+
+FAIL when the check status is 1, when the change misses something the Prompt asks for, changes behaviour the task did not ask to change, removes content the task did not ask to remove (the report counts the lines each file lost), or changes a file the report says is OUTSIDE THE SCOPE that the task does not need (an instruction file such as AGENTS.md, an unrelated module). A change outside the Scope that the fix needs (the same bug in a sibling file, a test fixture) is not a reason to fail: the planner's Scope is a guess. With a status of none, judge the change against the task yourself. Otherwise PASS.
+
+Answer with the verdict on the first line, exactly `verdict: PASS` or `verdict: FAIL`, then the findings, one per line. On FAIL, end with the repair instructions for the worker who fixes it: what to change, in which file, and why."""
+
+
+def judge_user(task, diff, check_log=None):
+    inconclusive = "" if check_log is None else f"""
+# What the Check printed
+
+The Check is a command, and it fails on the tree as the run found it too, the same way, so it could not decide. Read its output yourself: a change that should make it pass and does not is a FAIL.
+
+```
+{check_log}
+```
+"""
+    return f"""# The task
+
+{task}
+
+# The change (a unified diff; new files in full)
+
+```diff
+{diff}
+```
+{inconclusive}
+You are the judge, in a fresh context: you have seen none of the team's reasoning. Decide whether the change does what the task's Prompt asks, completely and correctly, within its Scope, and nothing the task did not ask. An end condition the person wrote into the Prompt is binding: PASS only when the change makes it hold. Done when is the planner's reading of the Prompt: a line of it that starts with (inferred), or that asks for what the Prompt does not (a changelog entry, docs, a test of a given shape, a wording the Prompt does not give), is not a reason to FAIL. The verdict is on the work, not on what it reports: a review that finds a bug passes when the bug is real. A change that removes content the task did not ask to remove fails.
+
+Answer with the verdict on the first line, exactly `verdict: PASS` or `verdict: FAIL`, then at most ten lines saying why, each tied to a line of the task."""
+
+
+AGENT_RULES = ("Do not commit, check out, reset or stash: the tree's HEAD stays where it is. Do not write a "
+               "rule or lesson into AGENTS.md or any other instruction file unless the task asks for it. Leave "
+               ".team-solve/ alone except for the run files named here. Do not spawn agents or rely on chat "
+               "history.")
+
+
+def direct_prompt(prompt):
+    return (f"{prompt.rstrip()}\n\n{AGENT_RULES} Write what the task asks for as soon as you have a first "
+            "version, then improve it: a turn that ends without it has done nothing.")
+
+
+def solve_prompt(rd):
+    return (f"You are the solver in a fresh context. The run's files are in {rd}/: task.md (the task: the "
+            "prompt and what the planner settled), plan.md, notes.md (the ledger every role writes to). They "
+            f"are never part of the work and never committed. {AGENT_RULES}\n"
+            "A first attempt at the task is already in the tree, and it did not pass: changes.diff is what it "
+            "changed, direct-check.log what the Check and the Scope said of it. Keep what is right in it, "
+            "correct what is wrong, undo what the task did not ask for.\n"
+            "Read task.md, plan.md, notes.md, proposal-a.md and proposal-b.md there. Select and justify an "
+            "approach in the Solver decision section of notes.md. Then do the task as task.md's Deliverable "
+            "says: change the project's files within the Scope, or write the new files it names, complete. "
+            "Write a first version of the deliverable early and improve it after: a turn that ends without it "
+            "has done nothing. Touch nothing outside the Scope and change nothing the task did not ask for. "
+            "Run the Check (the command, or a sample) before you finish and fix what it shows. Do not change "
+            "task.md, the prompt or test data. The steps after you check the work and own any repair round.")
+
+
+def repair_prompt(rd, round_no, judged):
+    why = "review.md" + (" and verdict.md (the judge's FAIL)" if judged else "")
+    return (f"You are the repair worker for round {round_no}, in a fresh context. The run's files are in {rd}/: "
+            "task.md (the task: the prompt and what the planner settled), plan.md, notes.md (the ledger every "
+            f"role writes to). They are never part of the work and never committed. {AGENT_RULES}\n"
+            f"The work in the tree did not pass. Read {why}, test-status.txt, test-output.log, changes.diff and "
+            "notes.md there, then task.md and plan.md, and correct the work using the instructions, as the task "
+            "needs. Undo a change outside the Scope only when the review names it as one the task does not "
+            "need; a change the fix needs stays, wherever it is. Run the Check to verify the correction. "
+            f"Write {rd}/repair.md: what you changed and what the Check printed, and append a short repair note "
+            "for this round to notes.md. Do not change task.md, the prompt, test inputs or expected outputs. "
+            "The next round's check, review and judge decide the run.")
+
+
+def nudge(missing):
+    return (f"Not done yet: {missing}. Finish it now in this turn, then stop.")

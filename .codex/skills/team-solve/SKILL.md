@@ -1,113 +1,96 @@
 ---
 name: team-solve
-description: "Solve any task whose success can be checked by a command, with a team of fresh-context roles that talk only through files, the GVS5H method: a planner, an ideator, a manager that owns the task list, workers, and a cut-off summarizer, up to 10 rounds, with a check (not a model) as ground truth each round. The check is either the built-in public-sample runner (contest problems) or a command you supply with --verify-cmd (make a test suite pass, make a build compile, satisfy a grader, hit a benchmark, reproduce an output); exit 0 means solved. Two modes: loop (default; one model call per role through the workspace router, byte-identical to the authors' prompts, one Python file as the artifact) and agents (memdoor's eight steps, each role a fresh `codex exec` agent that edits the whole workspace). Optional guards: --keep-best and --stress (a brute-force cross-check, samples only)."
-when_to_use: "Use when the user hands over a self-contained task with a clear success check and wants it driven to pass: an algorithmic/contest problem with sample tests ('solve this AtCoder/Codeforces/LeetCode problem', 'team-solve this'), or any task with a checkable command via --verify-cmd ('make these tests pass', 'get this to build', 'satisfy this grader'). Also a hard math or multiple-choice question with an ANSWER line (--spec aime|math500|gpqa|hle). Not for open-ended work with no way to check success by a command."
-argument-hint: "[problem folder] [--verify-cmd CMD] [--mode loop|agents] [--keep-best] [--stress]"
+description: "Do a task with a team of fresh-context roles that talk only through files, checked every round. Agents mode (the default for a prompt): `team_solve.py \"what to do\" [--until \"end condition\"]` works in the project; a planner settles the Check (a command, the public samples, or a judge when nothing can be run), one direct agent attempt goes first, then ideators, a solver and review/judge/repair rounds until it passes; --until makes the person's own end condition binding, --verify-cmd fixes the Check. Loop mode: the GVS5H method byte for byte (planner, ideator, manager, workers, cut-off summarizer, up to 10 rounds, one Python file) for contest problems with samples, a --verify-cmd folder, or a math/QA spec."
+when_to_use: "Use when the user hands over a task to drive to done with a team: '$team-solve do this and this', 'team-solve this until X holds', 'make these tests pass', 'get this to build', an algorithmic/contest problem with samples ('solve this AtCoder/Codeforces/LeetCode problem'), or a hard math or multiple-choice question with an ANSWER line (--spec aime|math500|gpqa|hle). Open-ended work without a command is fine: pass the user's end condition with --until, or let the planner fall back to the judge."
+argument-hint: "\"<task>\" [--until \"<end condition>\"] [--verify-cmd CMD] [--dir D] | run --dir D [--mode loop|agents] [--keep-best] [--stress]"
 metadata:
   author: coffeegrind123
-  version: "1.0"
+  version: "2.0"
 ---
 
 # team-solve
 
-Run the team; do not solve the problem yourself in this context. The point of the method is
-that every role starts fresh and reads only the files, and that a program run on the samples,
-not any model's claim, decides success.
+Run the team; do not do the task yourself in this context. The point of the method is that
+every role starts fresh and reads only the files, and that a check, not any one model's
+claim, decides success.
 
-Ground truth is a check, not a model. Pick the check:
+## 1. Pick the form
 
-- **contest / algorithmic problem** → the built-in public-sample runner. Lay out `tests/`
-  (below) and run with no `--verify-cmd`.
-- **any other command-checkable task** (make a test suite pass, make a build compile,
-  satisfy a grader, hit a benchmark, reproduce an output) → pass `--verify-cmd "CMD"`. The
-  team iterates until `CMD`, run in the folder, exits 0; its output is the manager's
-  feedback each round. In **agents mode** the roles edit the whole workspace with tools; in
-  **loop mode** they write one Python file (`--solution-file`, default `solution.py`), so
-  loop + `--verify-cmd` is for "write one script that passes this check" and multi-file
-  work wants `--mode agents`.
+The user's words are the task. Pass them through as they wrote them; do not rewrite them
+into a spec.
 
-## 1. Lay out the task folder
+- **"$team-solve <task>"** with an end condition in the words ("until X", "done when X",
+  "X must hold") → `"<task>" --until "<X>"`, with the condition in the user's own words.
+- **"$team-solve <task>"** naming a command ("pytest must pass", "make check") → `"<task>"`
+  alone is enough: the planner takes the command the prompt names. Add `--verify-cmd "CMD"`
+  only when the user gave the command separately and it must be the Check.
+- **"$team-solve <task>"** with neither → `"<task>"`. The planner settles a command from the
+  project's own tests, or the judge when nothing can be run.
+- **A contest problem with examples** → a folder with `task.md` and byte-exact
+  `tests/N.in` / `tests/N.out` (only samples the statement contains), then `run --dir D
+  --keep-best --stress` (loop mode, the benchmarked method).
+- **Math / multiple choice** → `run --dir D --spec aime|math500|gpqa|hle` (loop mode).
 
-One folder per task. The run writes into it. `task.md` (or `problem.md`, or `--problem
-FILE`) holds the statement. For the built-in sample check also add:
-
-```
-my-task/
-  task.md          the statement / task description
-  tests/1.in       public sample input         } sample check only
-  tests/1.out      its exact expected output    }  (omit when using --verify-cmd)
-  tests/func_name  only for LeetCode-style starter code: the method name. Each line of N.in is
-                   one JSON argument, N.out is the JSON result; solution.py defines class Solution.
-```
-
-If the user pasted a statement, write `task.md` verbatim (keep any starter code, the format
-section and the constraints) and write each sample pair into `tests/` byte for byte, with a
-trailing newline. Never invent samples: only ones the statement contains. For a `--verify-cmd`
-task, make sure the command already exists and runs in the folder. `sample/` in this skill is
-a worked contest example.
+The run works in `--dir` (default: the current folder). For a change to a project, that is
+the project's root, or the subfolder the task is about.
 
 ## 2. Run it
 
 ```sh
 S="$CODEX_HOME/skills/team-solve/scripts/team_solve.py"   # ./codex sets CODEX_HOME to this workspace's .codex
-python3 $S run --dir my-task                                  # contest: the authors' sample loop
-python3 $S run --dir my-task --keep-best --stress             # contest, both guards (recommended)
-python3 $S run --dir my-task --verify-cmd "pytest -q"         # generic loop: one Python file to pass pytest
-python3 $S run --dir my-task --verify-cmd "make" --mode agents # generic, whole-workspace agents
-python3 $S status --dir my-task                               # rounds, per-round verdict, tokens
-python3 $S check --dir my-task [--verify-cmd "CMD"]           # the strict check on its own
+python3 $S "Rename X to Y everywhere; go test ./... must pass" --dir /path/to/project
+python3 $S "Write docs/branching.md" --until "it names the feature/ prefix and the review rule" --dir P
+python3 $S "Fix the retry bug" --verify-cmd "pytest -q tests/test_client.py" --dir P
+python3 $S - --dir P < long-task.md                          # a long prompt from stdin
+python3 $S run --dir my-task --keep-best --stress           # contest, loop mode
+python3 $S status --dir P                                   # check kind, rounds, verdicts, keep, tokens
+python3 $S check --dir P                                    # the settled Check again on its own
 ```
 
-From a shell outside Codex the same thing is `./codex team-solve [args]` (router started,
-secrets loaded, Landlock cage applied). A run takes minutes to an hour; run it in the
-background and wait for it, do not poll.
+From a shell outside Codex the same is `./codex team-solve "<task>" [--until "..."]` (router
+started, secrets loaded, Landlock cage applied). A run takes minutes to an hour; run it in
+the background and wait for it, do not poll.
 
-Exit status: `0` solved (the check passed / math: an `ANSWER:` line exists), `1` not solved,
-`2` infrastructure (router down, no token, an agent role that could not run). Report exit 2 as
-an infrastructure failure with its message, not as "the team could not solve it".
+Exit status: `0` solved, `1` not solved, `2` infrastructure (router down, no token, an agent
+role that could not run). Report exit 2 as an infrastructure failure with its message, not as
+"the team could not solve it". Rerunning the same prompt after an exit 2 resumes the run.
 
 ## 3. Read the result
 
-- With the sample check, `solution.py` (or `answer.md`) is the answer. With `--verify-cmd`,
-  the result is the workspace the command passes against (agents mode) or the single solution
-  file (loop mode). `final-test-output.log` is the strict final check.
-- `status` shows each round's task and verdict (sample pass count, or the command's
-  pass/fail). `plan.md`, `notes.md`, `tasks.json` are the team's ledger. `.team-solve/calls/`
-  holds every request and reply; `transcript.jsonl` is the authors' transcript format;
-  `meter.jsonl` the tokens per call.
-- With the sample check, passing the samples is not passing the hidden tests — say so when
-  you report. With `--verify-cmd`, the result is exactly as strong as the command: report what
-  the command actually checks. `--stress` (samples only) adds a validated brute-force
-  cross-check, which is much stronger evidence.
+- Agents mode leaves its result in the project's tree. The run's own files are in
+  `.team-solve/runs/<id>/`, git-ignored: `task.md` (the prompt plus the settled Deliverable,
+  Check, Scope, Done when), `plan.md`, `notes.md`, `changes.diff`, `review-N.md`,
+  `verdict-N.md`, `keep.txt`, `final-check.log`.
+- `status` shows how it was decided:
+  - **checked by `<cmd>`** / **the samples**: a command passed. The result is exactly as strong
+    as that command; say what it checks.
+  - **judged, not checked**: nothing could be run, so a reviewer and a fresh judge agreed the
+    end condition holds. Say so plainly when you report: it is two model verdicts, not a test.
+- `keep.txt` says whether the team's work or the direct attempt was kept. When the direct
+  attempt was put back, the team's work is in `team.patch`.
+- Loop mode: `solution.py` (or `answer.md`) in the folder; passing the samples is not passing
+  the hidden tests — say so. `--stress` adds a validated brute-force cross-check.
 
 ## Options that matter
 
 | option | default | effect |
 |---|---|---|
-| `--verify-cmd` | off (samples) | the command that decides success (run in `--dir`, exit 0 = solved, output feeds the manager). Replaces the sample check and implies `--spec generic` |
-| `--solution-file` | `solution.py` | loop mode: the file the single-file solution is written to |
-| `--mode` | `loop` | `agents`: each role a full Codex agent editing the whole workspace; ~10x the tokens (memdoor's measurement). The real path for multi-file `--verify-cmd` tasks |
-| `--keep-best` | off | if the final program fails its check, restore the last one that passed (sample or command) |
-| `--stress` | off | samples only: one extra call writes `brute.py` + `gen.py`, validated on the samples; every passing program is compared on `--stress-cases` random small inputs, and a mismatch overrides the manager's "done" |
-| `--samples all` | `stdin` | also run functional (`tests/func_name`) samples inside the loop; the authors ran stdin ones only |
-| `--spec` | `code` | `generic` (neutral solver; implied by `--verify-cmd`), or `aime`, `math500`, `gpqa`, `hle` (the authors' math/QA prompts, result in `answer.md`) |
-| `--model` / `--effort` | `deepseek-flash` / `high` | any model the router routes (`glm-5.3` etc.) |
-| `--max-iters` | 10 | manager/worker rounds (authors') |
-| `--fresh` | off | a new independent attempt; default replays recorded calls |
-
-Rerunning the same command resumes: recorded calls whose request is byte-identical are
-replayed, and the run continues live from the first one that differs. That makes an
-interrupted run cheap to finish. For a second, independent attempt at the same problem,
-pass `--fresh`.
+| `"<task>"` / `-` | — | the task; implies agents mode. Without it the folder's `task.md` / `problem.md` is the task |
+| `--until` | — | the person's end condition: first line of Done when, word for word, and part of the Prompt every role reads. The run is done only when it holds |
+| `--verify-cmd` | — | the Check, fixed (agents) / the command that decides success (loop) |
+| `--mode` | `auto` | agents for a prompt, `--until`, or a folder with nothing to check; loop for samples, a `--verify-cmd` folder, or a math spec |
+| `--max-iters` | 10 | agents: review rounds (each after the first follows a repair); loop: manager/worker rounds |
+| `--role-timeout` | auto | agents: per agent turn (direct 30m, solve/repair 90m) |
+| `--keep-best` / `--stress` | off | loop mode guards (see README) |
+| `--model` / `--effort` | `deepseek-flash` / `high` | any routed model, for every role |
+| `--fresh` | off | a new independent run instead of resuming / replaying |
 
 ## What not to do
 
-- Do not edit the check — `tests/` or the `--verify-cmd` command — to force a pass, and do
-  not hand-edit the result and report it as the team's.
-- Do not change the role prompts in `scripts/teamsolve/prompts.py` casually: loop mode's
-  contest prompts are pinned byte for byte to the authors' code by `tests/test_team_solve.py`.
-- Loop-mode roles have no tools and produce one file; for multi-file or whole-workspace
-  `--verify-cmd` tasks use `--mode agents`.
-- Do not use it for open-ended work with no command that can decide success.
+- Do not edit the Check — `tests/`, the command, or the run's `task.md` — to force a pass, and
+  do not hand-edit the result and report it as the team's.
+- Do not change the loop-mode prompts in `scripts/teamsolve/prompts.py` casually: they are
+  pinned byte for byte to the authors' code by `tests/test_team_solve.py`.
+- Do not start team-solve from inside a role (`TEAM_SOLVE_ROLE` is set): it refuses.
 
 Provenance and licences: `NOTICE`.

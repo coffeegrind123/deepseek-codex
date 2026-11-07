@@ -24,11 +24,19 @@ orchestrator.py at commit b4cc2f734a28fdab6c37af48e612c4d9e40a7a20):
     CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
     THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-The agent mode's step prompts, the sample-checker semantics, the sample problem
-(sample/) and the parity-test scenarios in tests/test_team_solve.py are adapted from
-Memdoor (https://github.com/guregodevo/memdoor, examples/workflows/team-solve at commit
-4b7ca6e239cbc777fe8135410cd6771414242713), licensed under the Apache License, Version 2.0
-(http://www.apache.org/licenses/LICENSE-2.0). Changes: the prompts' memdoor paths and run
-identifier template were replaced with this skill's checker and run id; the workflow
-engine was replaced by teamsolve/agents.py; the checker was ported from bash to Python
-and extended to functional (starter-code) samples.
+The agent mode (scripts/teamsolve/pipeline.py, task.py, failures.py, gitstate.py and the
+agents-mode prompts in prompts.py) is adapted from Memdoor's built-in team-solve
+(https://github.com/guregodevo/memdoor, workflows/team-solve at commit
+47dad8b5ca3dcdeb559be8ff97f268762fb60980): its task template, planner, settle rules, check and
+baseline semantics, failures parser, scope report, direct/ideate/solve/review/repair/judge
+prompts and keep net. The sample-checker semantics, the sample problem (sample/) and the
+parity-test scenarios in tests/test_team_solve.py are adapted from Memdoor's
+examples/workflows/team-solve at commit 4b7ca6e239cbc777fe8135410cd6771414242713. Memdoor is
+licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+Changes: the workflow engine and its bash/awk scripts were rewritten in Python; memdoor's run
+folder and tools were replaced by this skill's (.team-solve/runs/<id>/, codex exec roles); the
+single review/repair round became a loop of rounds with a fresh judge; tree states are git
+trees through a private index (with a shadow repository outside git) instead of stash and
+mtime scans; a failing Check that a baseline cannot explain counts as a failure instead of
+turning the Check off; an --until end condition is carried into the Prompt and Done when; the
+checker was ported from bash to Python and extended to functional (starter-code) samples.

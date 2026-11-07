@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""team-solve: several fresh-context roles solve one problem through files on disk.
+"""team-solve: several fresh-context roles solve one task through files on disk.
 
-    team_solve.py run    [--dir D] [--mode loop|agents] [options]   solve; exit 0 when every sample passes
-    team_solve.py check  [--dir D]                                  strict sample check (check-samples.sh)
-    team_solve.py status [--dir D]                                  the last run's result and token totals
+    team_solve.py [run] "what to do" [--until "end condition"] [--dir D]   a task from a prompt (agents mode)
+    team_solve.py run    [--dir D] [--mode loop|agents] [options]           the folder's task.md / problem.md
+    team_solve.py check  [--dir D]                                          the strict check on its own
+    team_solve.py status [--dir D]                                          the last run's result and token totals
 
-The problem folder holds the statement (task.md, or problem.md, or --problem FILE) and
-paired public samples tests/N.in + tests/N.out (plus tests/func_name for a LeetCode-style
-starter-code problem). The run writes plan.md, notes.md, tasks.json, solution.py (or
-answer.md for --spec aime|math500|gpqa|hle), final-test-output.log and .team-solve/.
+A prompt is the task: the run works in --dir (default: the current folder, usually the
+project), a planner settles the Check (a command, the samples, or a judge when nothing can
+be run), and the team works until it passes. --until "sentence" makes the person's own end
+condition binding; --verify-cmd fixes the Check. The run's own files are in
+.team-solve/runs/<id>/, outside the project's diff.
 
-Exit status: 0 solved (every sample passes / an ANSWER line exists), 1 not solved,
-2 usage or infrastructure error (router down, no token, a role that could not run).
+Without a prompt the folder holds the statement (task.md, or problem.md, or --problem FILE)
+and, for a contest problem, paired public samples tests/N.in + tests/N.out (plus
+tests/func_name for a LeetCode-style starter-code problem). Loop mode writes plan.md,
+notes.md, tasks.json, solution.py (or answer.md for --spec aime|math500|gpqa|hle),
+final-test-output.log and .team-solve/.
+
+Exit status: 0 solved, 1 not solved, 2 usage or infrastructure error (router down, no
+token, a role that could not run).
 """
 import argparse
 import json
@@ -75,14 +83,47 @@ def strict_verdict(ws, spec_kind, verifier=None):
     return (EXIT_SOLVED if failures == 0 else EXIT_UNSOLVED), failures
 
 
+def prompt_from_args(a):
+    """The prompt words joined, or stdin for a lone '-'; '' when none was given."""
+    words = a.prompt or []
+    if words == ["-"]:
+        return sys.stdin.read()
+    return " ".join(words).strip()
+
+
+def pick_mode(a, ws, prompt):
+    """auto: agents for a prompt, an --until, or a folder with nothing a loop could check;
+    loop (the authors' benchmarked method) for samples, a --verify-cmd folder or a math spec."""
+    if a.mode != "auto":
+        return a.mode
+    if prompt or a.until:
+        return "agents"
+    if a.spec != "code" or a.verify_cmd or samples.load(ws):
+        return "loop"
+    return "agents"
+
+
 def cmd_run(a):
     if os.environ.get("TEAM_SOLVE_ROLE"):
         log(f"team-solve: refusing to start a team run inside role '{os.environ['TEAM_SOLVE_ROLE']}' "
             f"of another one")
         return EXIT_ERROR
     ws = os.path.abspath(a.dir)
-    problem_path = find_problem(ws, a.problem)
-    problem = open(problem_path).read()
+    if not os.path.isdir(ws):
+        log(f"team-solve: no such folder: {ws}")
+        return EXIT_ERROR
+    prompt = prompt_from_args(a)
+    a.mode = pick_mode(a, ws, prompt)
+    if a.until and a.mode == "loop":
+        log("team-solve: --until needs --mode agents: loop mode's ground truth is the samples or "
+            "--verify-cmd, and it writes one file")
+        return EXIT_ERROR
+    if a.mode == "agents":
+        return run_prompt(a, ws, prompt)
+    if prompt:
+        problem = prompt
+    else:
+        problem = open(find_problem(ws, a.problem)).read()
     if a.wrap_lcb:
         problem = prompts.lcb_prompt(problem.strip())
     # A custom verification command makes the task generic; use the neutral solver spec
@@ -110,10 +151,7 @@ def cmd_run(a):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 os.replace(calls, dest)
                 log(f"team-solve: --fresh: previous calls moved to {os.path.relpath(dest, ws)}")
-        if a.mode == "loop":
-            result = run_loop(a, ws, problem, spec, verifier)
-        else:
-            result = run_agents(a, ws, problem_path, verifier)
+        result = run_loop(a, ws, problem, spec, verifier)
         if result.get("error"):
             write_run(ws, a, result, started, bal0, None, None)
             log(f"team-solve: {result['error']}")
@@ -159,15 +197,60 @@ def run_loop(a, ws, problem, spec, verifier):
     return result
 
 
-def run_agents(a, ws, problem_path, verifier):
-    from teamsolve import agents
-    rel = os.path.relpath(problem_path, ws)
-    run = agents.AgentRun(ws, rel, a.model, a.effort, log, a.fresh, duration(a.role_timeout),
-                          verify_cmd=a.verify_cmd or None, verifier=verifier)
-    result = run.run()
-    if result.get("failed_step") not in (None, "verify"):
-        result["error"] = f"agent step '{result['failed_step']}' failed; logs in .team-solve/agents/"
-    return result
+def run_prompt(a, ws, prompt):
+    """agents mode: the task a prompt defines, in the project (teamsolve/pipeline.py)."""
+    from teamsolve import agents, client, gitstate, pipeline
+    if not prompt:
+        if a.problem or any(os.path.isfile(os.path.join(ws, n)) for n in PROBLEM_FILES):
+            prompt = open(find_problem(ws, a.problem)).read()
+        else:
+            log('team-solve: no task: team_solve.py "<what to do>" [--until "<end condition>"], '
+                f"or a {' or '.join(PROBLEM_FILES)} in {ws}")
+            return EXIT_ERROR
+    if a.verify_cmd:
+        log(f"team-solve: the Check is the command `{a.verify_cmd}` (exit 0 = solved)")
+    if a.until:
+        log(f"team-solve: end condition: {a.until}")
+    started = time.time()
+    bal0 = balance_snapshot()
+    try:
+        c = client.RouterClient(a.model, a.max_output_tokens, a.effort, a.top_p, a.top_k,
+                                a.attempts, duration(a.call_timeout), log=log)
+    except client.CallError as e:
+        log(f"team-solve: {e}")
+        return EXIT_ERROR
+    ok, detail = c.health()
+    if not ok:
+        log(f"team-solve: router not reachable at {client.router_base()} ({detail}); start it with "
+            f"./codex-router ensure")
+        return EXIT_ERROR
+    timeouts = {"direct_timeout": pipeline.DIRECT_TIMEOUT, "work_timeout": pipeline.WORK_TIMEOUT}
+    if a.role_timeout != "auto":
+        timeouts = {k: duration(a.role_timeout) for k in timeouts}
+    opts = pipeline.Options(until=a.until, verify_cmd=a.verify_cmd or None, verify_timeout=duration(a.verify_timeout),
+                            max_iters=a.max_iters, python=a.python, fresh=a.fresh, **timeouts)
+    with ledger.Lock(ws):
+        try:
+            run = pipeline.PromptRun(
+                ws, prompt, opts, log,
+                make_calls=lambda state: ledger.Calls(ws, c, log, replay=True, state=state),
+                make_codex=lambda d, meter: agents.Codex(ws, d, a.model, a.effort, log, meter))
+            log(f"team-solve: run {run.run_id} in {run.rel}/")
+            result = run.run()
+        except (agents.RoleError, client.CallError, gitstate.GitError) as e:
+            result = {"error": str(e)}
+        if result.get("error"):
+            write_run(ws, a, result, started, bal0, None, None)
+            log(f"team-solve: {result['error']}")
+            return EXIT_ERROR
+        code = EXIT_SOLVED if result["solved"] else EXIT_UNSOLVED
+        write_run(ws, a, result, started, bal0, code, None if code == EXIT_SOLVED else 1)
+    sys.stdout.write(ledger.read(ws, os.path.join(result["run_dir"], "final-check.log")))
+    how = "judged, not checked: no command could check it" if result["check_kind"] == "judge" else \
+        f"checked by {'the samples' if result['check_kind'] == 'samples' else '`' + result['check_cmd'] + '`'}"
+    log(f"team-solve: {'SOLVED' if code == EXIT_SOLVED else 'NOT SOLVED'} ({how}) -- "
+        f"{result['run_dir']}/  ({result['keep']['note']})")
+    return code
 
 
 def write_run(ws, a, result, started, bal0, code, failures):
@@ -185,12 +268,32 @@ def write_run(ws, a, result, started, bal0, code, failures):
 
 def cmd_check(a):
     ws = os.path.abspath(a.dir)
+    from teamsolve import verify
     if getattr(a, "verify_cmd", None):
-        from teamsolve import verify
         failures = verify.CommandVerifier(a.verify_cmd, duration(a.verify_timeout)).verdict(ws, sys.stdout)
+    elif not samples.load(ws) and last_prompt_run(ws):
+        # A prompt run's settled Check: its command, or the judge's recorded verdict.
+        rec = last_prompt_run(ws)
+        r = rec["result"]
+        if r.get("check_kind") == "command":
+            failures = verify.CommandVerifier(r["check_cmd"], duration(a.verify_timeout)).verdict(ws, sys.stdout)
+        else:
+            from teamsolve.pipeline import verdict_of
+            v = verdict_of(ledger.read(ws, os.path.join(r["run_dir"], "verdict.md")))
+            print(f"no command to run: the run's judge said {v} ({r['run_dir']}/verdict.md)")
+            failures = 0 if v == "PASS" else 1
     else:
         failures = samples.check(ws, python=a.python)
     return EXIT_SOLVED if failures == 0 else EXIT_UNSOLVED
+
+
+def last_prompt_run(ws):
+    p = ledger.state_path(ws, "run.json")
+    if not os.path.exists(p):
+        return None
+    rec = json.load(open(p))
+    r = rec.get("result") or {}
+    return rec if r.get("run_dir") and r.get("check_kind") else None
 
 
 def cmd_status(a):
@@ -204,8 +307,9 @@ def cmd_status(a):
     o = rec.get("options") or {}
     print(f"mode {o.get('mode')}  model {o.get('model')}  spec {o.get('spec')}  "
           f"finished {rec.get('finished_at')}  {rec.get('seconds')}s")
-    ground = f"command `{o.get('verify_cmd')}`" if o.get("verify_cmd") else "samples"
-    print(f"ground truth: {ground}")
+    if o.get("mode") == "loop":
+        ground = f"command `{o.get('verify_cmd')}`" if o.get("verify_cmd") else "samples"
+        print(f"ground truth: {ground}")
     fcount = rec.get("final_failures")
     print(f"verdict: {'SOLVED' if rec.get('exit') == 0 else 'NOT SOLVED'}"
           + (f"  (check failures: {fcount})" if fcount is not None else ""))
@@ -222,8 +326,24 @@ def cmd_status(a):
             verdict = h.get("check") or h.get("samples")
             print(f"  round {h['round']}: check {verdict}  stress {h.get('stress')}  task: {h['task'][:90]}")
     else:
-        print(f"steps {r.get('steps')}  failed_step {r.get('failed_step')}  initial_status "
-              f"{r.get('initial_status')}  usage {r.get('usage')}")
+        if r.get("error"):
+            print(f"error: {r['error']}")
+        else:
+            kind = r.get("check_kind")
+            how = {"command": f"command `{r.get('check_cmd')}`", "samples": "samples",
+                   "judge": "the judge (judged, not checked: no command could check it)"}.get(kind, kind)
+            print(f"run {r.get('run_id')} in {r.get('run_dir')}/  check settled: {how}")
+            if o.get("until"):
+                print(f"end condition: {o.get('until')}")
+            print(f"direct attempt {'passed' if r.get('direct_passed') else 'did not pass'}  rounds {r.get('rounds')}  "
+                  f"accepted {r.get('accepted')}  stopped {r.get('stopped')}  final check {r.get('final_check')}  "
+                  f"outside scope {r.get('outside_scope')}")
+            print(f"{(r.get('keep') or {}).get('note')}")
+            for h in r.get("history") or []:
+                print(f"  round {h['round']}: check {h['check']}  review {h['review']}  judge {h['judge']}  "
+                      f"{'ACCEPTED' if h['accepted'] else 'not accepted'}")
+            print(f"calls {r.get('calls')} ({r.get('live_calls')} live, {r.get('replayed_calls')} replayed)  "
+                  f"tokens {r.get('tokens')}  agent usage {r.get('usage')}")
     if "balance_delta_usd" in rec:
         print(f"DeepSeek balance change during the run: ${rec['balance_delta_usd']} "
               f"(account-wide; includes any other session's spend)")
@@ -238,10 +358,18 @@ def parser():
     common.add_argument("--dir", default=".", help="problem folder (default: cwd)")
     common.add_argument("--python", default=sys.executable, help="interpreter that runs solution.py")
 
-    r = sub.add_parser("run", parents=[common], help="solve the problem in --dir")
-    r.add_argument("--mode", choices=("loop", "agents"), default="loop",
-                   help="loop: the authors' one-call-per-role loop (default); agents: memdoor's "
-                        "eight steps, each a fresh codex exec agent")
+    r = sub.add_parser("run", parents=[common], help="do the task a prompt defines, or the problem in --dir")
+    r.add_argument("prompt", nargs="*",
+                   help="the task, in plain words ('-' reads it from stdin). Without one, the folder's "
+                        "task.md / problem.md is the task")
+    r.add_argument("--until", metavar="SENTENCE",
+                   help="the end condition in plain words: the run is done only when the judge (and the "
+                        "Check, when one can be run) agree it holds. Agents mode")
+    r.add_argument("--mode", choices=("auto", "loop", "agents"), default="auto",
+                   help="agents: direct attempt, planner, ideators, solver, review/judge/repair rounds, "
+                        "editing the project with codex exec (the default for a prompt, --until, or a "
+                        "folder with nothing to check); loop: the authors' one-call-per-role loop writing "
+                        "one file (the default for samples, a --verify-cmd folder or a math spec)")
     r.add_argument("--problem", help="statement file (default: task.md, else problem.md)")
     r.add_argument("--spec", choices=sorted(prompts.SPECS), default="code",
                    help="role prompts: code (default), generic (any command-checkable task), or a "
@@ -261,7 +389,8 @@ def parser():
     r.add_argument("--max-output-tokens", type=int, default=128000, help="reply cap per call (authors: 128K)")
     r.add_argument("--top-p", type=float, default=0.95, help="authors' value; --top-p -1 omits it")
     r.add_argument("--top-k", type=int, default=None, help="omitted by default (a Qwen generation-config value)")
-    r.add_argument("--max-iters", type=int, default=10)
+    r.add_argument("--max-iters", type=int, default=10,
+                   help="loop: manager/worker rounds; agents: review rounds (each after the first follows a repair)")
     r.add_argument("--max-tasks", type=int, default=12)
     r.add_argument("--strict-format", choices=("auto", "on", "off"), default="auto")
     r.add_argument("--samples", choices=("stdin", "all"), default="stdin",
@@ -272,7 +401,8 @@ def parser():
     r.add_argument("--stress-attempts", type=int, default=2)
     r.add_argument("--attempts", type=int, default=4, help="attempts per model call")
     r.add_argument("--call-timeout", default="4h", help="wall clock per model call (memdoor: 4h)")
-    r.add_argument("--role-timeout", default="10m", help="agents mode: wall clock per role (memdoor: 10m)")
+    r.add_argument("--role-timeout", default="auto",
+                   help="agents mode: wall clock per agent turn (auto: direct 30m, solve and repair 90m, memdoor's)")
     r.add_argument("--fresh", action="store_true", help="discard recorded calls instead of replaying them")
     r.set_defaults(func=cmd_run)
 
@@ -285,7 +415,14 @@ def parser():
     return ap
 
 
+SUBCOMMANDS = ("run", "check", "status")
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `team_solve.py "do this"` is `team_solve.py run "do this"`.
+    if argv and argv[0] not in SUBCOMMANDS and argv[0] not in ("-h", "--help"):
+        argv.insert(0, "run")
     a = parser().parse_args(argv)
     if getattr(a, "top_p", None) is not None and a.top_p < 0:
         a.top_p = None
