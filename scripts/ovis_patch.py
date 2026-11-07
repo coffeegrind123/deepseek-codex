@@ -25,6 +25,11 @@ What it does (measured 2026-11-01 against Codex 0.166.0 and bundle 40):
                                 defaults to Codex until this browser chose.
   server/codex-ready.ts         NEW. Whether a Codex process's session thread
                                 is up, from Codex's own log database.
+  dist/deepseek-balance.js      NEW. The DeepSeek balance in the composer's
+  server/deepseek-balance.ts    NEW. model pill, from the Codex footer's cache
+                                or DeepSeek; /api/deepseek/balance
+                                (README "DeepSeek balance").
+  server/pane-routes.ts         routes /api/deepseek/balance.
   server/core/composer.ts       a chat message and a queued delivery to a Codex
   server/core/pending.ts        pane wait for that thread (at most 180 s), as
                                 anything typed before it loses the session
@@ -51,8 +56,20 @@ PATCH_DIR = os.path.join(REPO, "patches", "ovis")
 NEW_FILES = (
     ("codex-workspace-defaults.js", "dist/codex-workspace-defaults.js"),
     ("codex-ready.ts", "server/codex-ready.ts"),
+    ("deepseek-balance.ts", "server/deepseek-balance.ts"),
+    ("deepseek-balance.js", "dist/deepseek-balance.js"),
 )
 MARK = "codex-workspace:"
+
+
+def _content_version(name: str) -> str:
+    """First 12 hex of a patch file's sha256: Ovis serves root files with max-age=86400, so the
+    page names the script by its content and an edited script is a new URL, never a stale cache."""
+    with open(os.path.join(PATCH_DIR, name), "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()[:12]
+
+
+BALANCE_VERSION = _content_version("deepseek-balance.js")
 EXIT_REFUSED = 2
 # Touched whenever anything here changed: ovis.sh restarts a server older than it.
 STAMP = ".codex-workspace-patched"
@@ -155,8 +172,34 @@ EDITS: list[tuple[str, str, list[tuple[str, str]]]] = [
             '    <meta charset="UTF-8" />\n',
             '    <meta charset="UTF-8" />\n'
             '    <!-- codex-workspace: the New workspace / New tab picker defaults to Codex (patches/ovis) -->\n'
-            '    <script src="/codex-workspace-defaults.js"></script>\n',
+            '    <script src="/codex-workspace-defaults.js"></script>\n'
+            '    <!-- codex-workspace: the DeepSeek balance beside the composer model pill -->\n'
+            f'    <script src="/deepseek-balance.js?v={BALANCE_VERSION}"></script>\n',
         )],
+    ),
+    (
+        "server/pane-routes.ts",
+        "2148ed95a61766b4ede91a10bfbd10dc08906b363f7f8d7ee2b69248e9adb9ba",
+        [
+            (
+                'import { conversationImage, ConversationReadPending, ConversationUnavailable, forgetPaneTranscriptState, '
+                'HistoryChanged, paneConversation, paneProcessRoots, paneTranscript, toolOutput } from "./conversation.ts";\n',
+                'import { conversationImage, ConversationReadPending, ConversationUnavailable, forgetPaneTranscriptState, '
+                'HistoryChanged, paneConversation, paneProcessRoots, paneTranscript, toolOutput } from "./conversation.ts";\n'
+                '// codex-workspace: the DeepSeek balance for the composer pill (patches/ovis/deepseek-balance.ts)\n'
+                'import { deepseekBalanceRoute, BALANCE_PATH } from "./deepseek-balance.ts";\n',
+            ),
+            (
+                '  if (pathname === "/api/pane/conversation") {\n',
+                '  // codex-workspace: the DeepSeek balance for the composer pill (patches/ovis)\n'
+                '  if (pathname === BALANCE_PATH) {\n'
+                '    setRequestRoute(pathname);\n'
+                '    return deepseekBalanceRoute(pathname, request);\n'
+                '  }\n'
+                '\n'
+                '  if (pathname === "/api/pane/conversation") {\n',
+            ),
+        ],
     ),
 ]
 

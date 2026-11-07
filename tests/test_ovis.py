@@ -33,6 +33,7 @@ cage) was measured live on 2026-11-01.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -380,7 +381,7 @@ class OvisPatch(unittest.TestCase):
     patch keeps beside the installed bundle; skipped where it is not installed)."""
 
     FILES = ("server/skills/codex.ts", "server/workspace-routes.ts", "dist/index.html",
-             "server/core/composer.ts", "server/core/pending.ts")
+             "server/core/composer.ts", "server/core/pending.ts", "server/pane-routes.ts")
     PATCH = os.path.join(SCRIPTS, "ovis_patch.py")
 
     def setUp(self) -> None:
@@ -421,6 +422,16 @@ class OvisPatch(unittest.TestCase):
         self.assertIn('arrivedAt += await waitForCodexReady(paneId, () => authorizePending(owner, paneId, lease));',
                       self.read("server/core/pending.ts"))
         self.assertIn("export async function waitForCodexReady", self.read("server/codex-ready.ts"))
+        index = self.read("dist/index.html")
+        routes = self.read("server/pane-routes.ts")
+        with open(os.path.join(REPO, "patches", "ovis", "deepseek-balance.js"), "rb") as fh:
+            balance_version = hashlib.sha256(fh.read()).hexdigest()[:12]
+        # versioned by content: Ovis caches root files for a day
+        self.assertIn(f'<script src="/deepseek-balance.js?v={balance_version}"></script>', index)
+        self.assertIn('import { deepseekBalanceRoute, BALANCE_PATH } from "./deepseek-balance.ts";', routes)
+        self.assertLess(routes.index("if (pathname === BALANCE_PATH)"), routes.index('pathname === "/api/pane/conversation")'))
+        self.assertIn("export async function deepseekBalanceRoute", self.read("server/deepseek-balance.ts"))
+        self.assertIn("__codexWorkspaceBalance", self.read("dist/deepseek-balance.js"))
         self.assertTrue(os.path.exists(os.path.join(self.tmp, ".codex-workspace-patched")))
 
     def test_refuses_another_bundle_and_changes_nothing(self) -> None:
@@ -441,6 +452,47 @@ class OvisPatch(unittest.TestCase):
         self.assertIn("server/workspace-routes.ts is neither", proc.stderr)
         self.assertEqual(self.read("server/skills/codex.ts"), before)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "dist/codex-workspace-defaults.js")))
+
+
+class DeepSeekBalance(unittest.TestCase):
+    """patches/ovis/deepseek-balance.{ts,js}: the server module under the bundle's bun, the
+    pill's formatting under node (tests/ovis-deepseek-balance*.test.*)."""
+
+    BUN = os.path.join(REPO, "tools", "ovis", "bin", "bun")
+
+    def test_server_module(self) -> None:
+        if not os.access(self.BUN, os.X_OK):
+            self.skipTest("Ovis bundle not installed (./codex ovis install)")
+        proc = subprocess.run([self.BUN, "test", os.path.join(REPO, "tests", "ovis-deepseek-balance.test.ts")],
+                              capture_output=True, text=True, cwd=REPO, timeout=600)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, output)
+        self.assertRegex(output, r"\b[1-9]\d* pass\b")
+        self.assertRegex(output, r"\b0 fail\b")
+
+    def test_browser_pill(self) -> None:
+        proc = subprocess.run(["node", "--test", os.path.join(REPO, "tests", "ovis-deepseek-balance-client.test.mjs")],
+                              capture_output=True, text=True, cwd=REPO, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"# pass [1-9]\d*")
+
+    def test_route_is_not_claimed_by_ovis(self) -> None:
+        dispatch = os.path.join(REPO, "tools", "ovis", "server", "dispatch.ts")
+        if not os.path.exists(dispatch):
+            self.skipTest("Ovis bundle not installed (./codex ovis install)")
+        with open(dispatch, encoding="utf-8") as fh:
+            self.assertNotIn('"/api/deepseek', fh.read())
+
+    def test_supervisor_passes_the_key_read_as_text_and_the_shared_cache(self) -> None:
+        with open(os.path.join(SCRIPTS, "ovis.sh"), encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('DEEPSEEK_API_KEY="$(cfg DEEPSEEK_API_KEY)"', script)
+        # the same file the ./codex wrapper's footer daemon writes
+        self.assertIn('DEEPSEEK_BALANCE_CACHE_FILE="$ROOT/.codex/cache/deepseek-balance.json"', script)
+        with open(os.path.join(REPO, "codex"), encoding="utf-8") as fh:
+            self.assertIn('DEEPSEEK_BALANCE_CACHE_FILE="$ROOT/.codex/cache/deepseek-balance.json"', fh.read())
+        self.assertIn('DEEPSEEK_BALANCE_LIB="$ROOT/plugins/deepseek-balance/lib/deepseek-balance.mjs"', script)
+        self.assertTrue(os.path.exists(os.path.join(REPO, "plugins", "deepseek-balance", "lib", "deepseek-balance.mjs")))
 
 
 class Shim(Isolated):

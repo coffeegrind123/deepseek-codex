@@ -100,6 +100,14 @@ The wrapper retains the terminal-title balance indicator by default; set
 `CODEX_DEEPSEEK_BALANCE_TITLE=off` to disable only the title while keeping the footer cache
 fresh. Inside herdr panes it does the same, since herdr names a pane after its title.
 
+Ovis shows the same balance in the composer pill, after the model and effort
+(`deepseek-flash · High · $19.55`), only when the pane's model is a DeepSeek one. It turns the
+warning colour below $2 or when DeepSeek reports the account unavailable, dims when stale, and its
+tooltip gives granted/topped-up amounts and the age. The Ovis server (outside the cage) answers
+`/api/deepseek/balance` from the footer cache above when it is under 90 s old, and otherwise
+queries DeepSeek itself through the plugin library, at most once a minute; the key never reaches the
+browser. Code: `patches/ovis/deepseek-balance.{ts,js}`, applied by `scripts/ovis_patch.py`.
+
 `./codex` starts the router if needed, loads `.codex/secrets.env`, applies the Landlock cage,
 then runs Codex with `CODEX_HOME` here and cwd in the folder you ran it from (or `-C DIR`),
 which the cage also makes writable. From `/` or `$HOME` it falls back to this folder.
