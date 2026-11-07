@@ -423,10 +423,19 @@ class OvisPatch(unittest.TestCase):
                       self.read("server/core/pending.ts"))
         self.assertIn("export async function waitForCodexReady", self.read("server/codex-ready.ts"))
         index = self.read("dist/index.html")
+        with open(os.path.join(REPO, "patches", "ovis", "voice-narration.js"), "rb") as fh:
+            version = hashlib.sha256(fh.read()).hexdigest()[:12]
+        # versioned by content: Ovis caches root files for a day
+        self.assertIn(f'<script src="/voice-narration.js?v={version}"></script>', index)
+        self.assertLess(index.index("/voice-narration.js"), index.index('type="module"'),
+                        "narration must load before the app to see its socket")
         routes = self.read("server/pane-routes.ts")
+        self.assertIn('import { voiceNarrationRoute } from "./voice-narration.ts";', routes)
+        self.assertLess(routes.index('pathname.startsWith("/api/narration/")'), routes.index('pathname === "/api/pane/conversation")'))
+        self.assertIn("export async function voiceNarrationRoute", self.read("server/voice-narration.ts"))
+        self.assertIn("__codexWorkspaceNarration", self.read("dist/voice-narration.js"))
         with open(os.path.join(REPO, "patches", "ovis", "deepseek-balance.js"), "rb") as fh:
             balance_version = hashlib.sha256(fh.read()).hexdigest()[:12]
-        # versioned by content: Ovis caches root files for a day
         self.assertIn(f'<script src="/deepseek-balance.js?v={balance_version}"></script>', index)
         self.assertIn('import { deepseekBalanceRoute, BALANCE_PATH } from "./deepseek-balance.ts";', routes)
         self.assertLess(routes.index("if (pathname === BALANCE_PATH)"), routes.index('pathname === "/api/pane/conversation")'))
@@ -452,6 +461,48 @@ class OvisPatch(unittest.TestCase):
         self.assertIn("server/workspace-routes.ts is neither", proc.stderr)
         self.assertEqual(self.read("server/skills/codex.ts"), before)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "dist/codex-workspace-defaults.js")))
+
+
+class VoiceNarration(unittest.TestCase):
+    """patches/ovis/voice-narration.{ts,js}: the server module under the bundle's bun, the
+    browser narrator under node (tests/ovis-voice-narration*.test.*)."""
+
+    BUN = os.path.join(REPO, "tools", "ovis", "bin", "bun")
+
+    def test_server_module(self) -> None:
+        if not os.access(self.BUN, os.X_OK):
+            self.skipTest("Ovis bundle not installed (./codex ovis install)")
+        proc = subprocess.run([self.BUN, "test", os.path.join(REPO, "tests", "ovis-voice-narration.test.ts")],
+                              capture_output=True, text=True, cwd=REPO, timeout=600)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, output)
+        # bun exits 0 when a path filter matches no file: require that tests really ran
+        self.assertRegex(output, r"\b[1-9]\d* pass\b")
+        self.assertRegex(output, r"\b0 fail\b")
+
+    def test_browser_narrator(self) -> None:
+        proc = subprocess.run(["node", "--test", os.path.join(REPO, "tests", "ovis-voice-narration-client.test.mjs")],
+                              capture_output=True, text=True, cwd=REPO, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"# pass [1-9]\d*")
+
+    def test_narration_prefix_is_not_claimed_by_ovis(self) -> None:
+        # Ovis's own dictation owns /api/voice/* and answers 404 for any other path under it,
+        # before the pane routes run: narration routes there were silently unreachable.
+        dispatch = os.path.join(REPO, "tools", "ovis", "server", "dispatch.ts")
+        if not os.path.exists(dispatch):
+            self.skipTest("Ovis bundle not installed (./codex ovis install)")
+        with open(dispatch, encoding="utf-8") as fh:
+            claimed = fh.read()
+        with open(os.path.join(REPO, "patches", "ovis", "voice-narration.ts"), encoding="utf-8") as fh:
+            module = fh.read()
+        self.assertIn('pathname.startsWith("/api/narration/")', module)
+        self.assertNotIn('"/api/narration', claimed)
+
+    def test_supervisor_passes_voiceapi_settings_read_as_text(self) -> None:
+        with open(os.path.join(SCRIPTS, "ovis.sh"), encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('VOICEAPI_URL="$(cfg VOICEAPI_URL)" VOICEAPI_KEY="$(cfg VOICEAPI_KEY)"', script)
 
 
 class DeepSeekBalance(unittest.TestCase):

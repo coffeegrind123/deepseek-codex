@@ -1,0 +1,29 @@
+{
+  "name": "voiceapi",
+  "version": "0.1.0",
+  "description": "Clone voices from dropped audio, speak with them, transcribe and clean speech through a self-hosted voiceapi.",
+  "keywords": [
+    "voice",
+    "tts",
+    "voice-clone",
+    "transcription",
+    "speech-enhancement"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Voice API",
+    "shortDescription": "Turn a recording into a custom voice, then speak with it",
+    "longDescription": "Uploads local audio (for example a file dropped into the Ovis chat) to a self-hosted voiceapi gateway, which cleans it with NVIDIA RE-USE, transcribes it with Qwen3-ASR and builds a Qwen3-TTS clone voice. Also synthesizes speech to local files, transcribes, and cleans audio.",
+    "developerName": "Local Workspace",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Turn the file I just dropped into a custom voice called Narrator.",
+      "Say \"hello there\" with my Narrator voice."
+    ]
+  }
+}

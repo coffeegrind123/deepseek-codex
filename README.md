@@ -125,6 +125,34 @@ input until it is ready. Two startup warnings are expected: `--dangerously-bypas
 (passed by `./codex`, see *End-result verifier*) and "Running without the shared background
 server" (the TUI runs its app server in-process).
 
+### Voice API
+
+The local `voiceapi` plugin connects agents to a self-hosted
+[voiceapi](https://github.com/coffeegrind123/voiceapi) gateway (Qwen3-TTS voice cloning,
+NVIDIA RE-USE cleanup, Qwen3-ASR). Drop a recording into the Ovis chat and say "make this a
+voice called Narrator": the agent calls `create_voice_from_file` with the `/.ovis/` path Ovis
+put in the message, and the plugin uploads the file itself. The audio never enters the model's
+context. Then "say hello" calls `speak`, which saves an mp3 next to the conversation.
+
+A voice made this way becomes voiceapi's **default voice**, stored in the gateway rather than in
+the session, so a new session with no history still speaks with it. It stays the default until
+you ask to change it or turn it off (`set_default_voice`).
+
+**Spoken replies in Ovis.** With `VOICEAPI_KEY` set, every reply an agent writes in the Ovis chat
+is read aloud in the default voice as it arrives: the assistant's text only, never tool calls or
+reasoning, for Codex, pi and any other agent Ovis understands. A chip in the page header
+cycles *all replies → final answers only → off* (remembered per browser) and skips the current
+reply while it speaks; sending a message stops it. Browsers allow sound only after you click or
+tap the page once. History already in a chat when you open it is not read. The Ovis server holds
+the key (`scripts/ovis.sh` passes `VOICEAPI_URL`/`VOICEAPI_KEY`); the browser sees only reply ids
+and audio. Code: `patches/ovis/voice-narration.{ts,js}`, applied by `scripts/ovis_patch.py`.
+
+Tools: `create_voice_from_file`, `speak`, `get_default_voice`, `set_default_voice`,
+`transcribe_file`, `enhance_file`, `list_voices`, `delete_voice`, `get_job`. Set `VOICEAPI_KEY` (and `VOICEAPI_URL` if the gateway is not at
+`http://host.docker.internal:8080`) in `.codex/secrets.env`. It needs the open network policy:
+`CODEX_NET=restricted` blocks the gateway. Only audio and video files are uploaded, and
+credential-looking paths are refused before anything is read. Tests: `npm run test:voiceapi`.
+
 ### Approvals — yolo by default
 
 `config.toml` sets `approval_policy = "never"`: the model runs every command on its own

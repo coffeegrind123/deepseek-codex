@@ -340,6 +340,8 @@ supervise() {
     tok="$(token)"
     started=$(date +%s)
     log "starting Ovis ($(cat "$OVIS_DIR/bundle.json" 2>/dev/null))"
+    # Reply narration (patches/ovis/voice-narration.ts) gets the voiceapi gateway and its key, read
+    # from secrets.env as text by cfg like every other setting: the server never sources the file.
     # The composer's DeepSeek balance (patches/ovis/deepseek-balance.ts) reads the Codex footer's
     # cache first and queries DeepSeek itself through the plugin library when it is not fresh.
     # Ovis reads its token from OVIS_TOKEN alone, and empty or unset means none,
@@ -351,6 +353,7 @@ supervise() {
       OVIS_TELEMETRY=0 DO_NOT_TRACK=1 OVIS_AUTO_UPDATE=0 NO_OPEN_BROWSER=1 OVIS_NO_OPEN=1 \
       OVIS_STATE_DIR="$STATE_DIR/state" OVIS_PASTE_DIR="$STATE_DIR/paste" \
       OVIS_HERDR_BIN="$HERDR" CODEX_HOME="$ROOT/.codex" \
+      VOICEAPI_URL="$(cfg VOICEAPI_URL)" VOICEAPI_KEY="$(cfg VOICEAPI_KEY)" \
       DEEPSEEK_API_KEY="$(cfg DEEPSEEK_API_KEY)" DEEPSEEK_BALANCE_URL="$(cfg DEEPSEEK_BALANCE_URL)" \
       DEEPSEEK_BALANCE_CACHE_FILE="$ROOT/.codex/cache/deepseek-balance.json" \
       DEEPSEEK_BALANCE_LIB="$ROOT/plugins/deepseek-balance/lib/deepseek-balance.mjs" \

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "voiceapi": {
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs"
+      ],
+      "cwd": ".",
+      "env_vars": [
+        "VOICEAPI_KEY",
+        "VOICEAPI_URL",
+        "VOICEAPI_OUTPUT_DIR",
+        "TMPDIR"
+      ],
+      "startup_timeout_sec": 30,
+      "tool_timeout_sec": 960
+    }
+  }
+}

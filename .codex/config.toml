@@ -190,6 +190,9 @@ enabled = true
 [plugins."subagent-labels@workspace"]
 enabled = true
 
+[plugins."voiceapi@workspace"]
+enabled = true
+
 # The built-in deep-scan coordinator requires a managed permission profile, which
 # this Landlock-caged workspace cannot expose. Route deep scans to the workspace
 # cxsec-security skill instead.

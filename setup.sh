@@ -265,6 +265,29 @@ grep -q '^\[plugins\."subagent-labels@workspace"\]' "$CONFIG" \
   || die "config.toml does not enable subagent-labels@workspace"
 ok "subagent-labels plugin $SL_VERSION"
 
+printf '== voiceapi plugin\n'
+VA_SRC="$ROOT/plugins/voiceapi"
+VA_STAGE="$ROOT/marketplace/plugins/voiceapi"
+[[ -f "$VA_SRC/.codex-plugin/plugin.json" ]] || die "$VA_SRC/.codex-plugin/plugin.json missing"
+VA_VERSION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' "$VA_SRC/.codex-plugin/plugin.json")"
+if (( CHECK_ONLY )); then
+  [[ -d "$VA_STAGE" ]] || die "voiceapi plugin is not staged; run without --check"
+  if ! diff -qr "$VA_SRC" "$VA_STAGE" >/dev/null; then
+    die "voiceapi plugin stage differs from $VA_SRC; run without --check"
+  fi
+else
+  rm -rf -- "$VA_STAGE"
+  mkdir -p "$VA_STAGE"
+  cp -a "$VA_SRC/." "$VA_STAGE/"
+  CODEX_HOME="$ROOT/.codex" "$CODEX_BIN" plugin add voiceapi@workspace >/dev/null
+  node --test "$ROOT/plugins/voiceapi/test/mcp-server.test.mjs" >/dev/null
+fi
+VA_CACHE="$ROOT/.codex/plugins/cache/workspace/voiceapi/$VA_VERSION/.codex-plugin/plugin.json"
+[[ -f "$VA_CACHE" ]] || die "voiceapi $VA_VERSION not installed; run without --check"
+grep -q '^\[plugins\."voiceapi@workspace"\]' "$CONFIG" \
+  || die "config.toml does not enable voiceapi@workspace"
+ok "voiceapi plugin $VA_VERSION"
+
 printf '== Ovis (web and phone client, README "Ovis")\n'
 # The pinned prebuilt bundle (herdr, bun, the web UI) in tools/ovis, plus herdr's
 # Codex hook generated from it. Nothing is compiled.

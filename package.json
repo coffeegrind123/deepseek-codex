@@ -17,7 +17,8 @@
     "test:security-cost": "node --test tests/test_codex_security_cost_config.mjs && python3 -m pytest -q tests/test_codex_security_cost_config.py tests/test_codex_security_usage.py tests/test_patch_codex_security_plugin.py",
     "test:team-solve": "GVS5H_ESCALATION=\"$(bash tests/fetch_gvs5h.sh)\" python3 -m pytest -q tests/test_team_solve.py",
     "test:ovis": "python3 -m pytest -q tests/test_ovis.py",
-    "test:all": "npm test && npm run test:wrapper && npm run test:updater && npm run test:balance && npm run test:subagents && npm run test:security-cost && npm run test:team-solve && npm run test:ovis"
+    "test:all": "npm test && npm run test:wrapper && npm run test:updater && npm run test:balance && npm run test:subagents && npm run test:voiceapi && npm run test:security-cost && npm run test:team-solve && npm run test:ovis",
+    "test:voiceapi": "node --test plugins/voiceapi/test/mcp-server.test.mjs"
   },
   "dependencies": {
     "@openai/codex": "0.166.0",

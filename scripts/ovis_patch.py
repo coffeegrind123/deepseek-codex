@@ -25,11 +25,13 @@ What it does (measured 2026-11-01 against Codex 0.166.0 and bundle 40):
                                 defaults to Codex until this browser chose.
   server/codex-ready.ts         NEW. Whether a Codex process's session thread
                                 is up, from Codex's own log database.
+  dist/voice-narration.js       NEW. Speaks agent replies (assistant text, never
+  server/voice-narration.ts     NEW. tool calls) in voiceapi's default voice;
+  server/pane-routes.ts         routes /api/narration/* (README "Voice API").
   dist/deepseek-balance.js      NEW. The DeepSeek balance in the composer's
   server/deepseek-balance.ts    NEW. model pill, from the Codex footer's cache
                                 or DeepSeek; /api/deepseek/balance
                                 (README "DeepSeek balance").
-  server/pane-routes.ts         routes /api/deepseek/balance.
   server/core/composer.ts       a chat message and a queued delivery to a Codex
   server/core/pending.ts        pane wait for that thread (at most 180 s), as
                                 anything typed before it loses the session
@@ -56,6 +58,8 @@ PATCH_DIR = os.path.join(REPO, "patches", "ovis")
 NEW_FILES = (
     ("codex-workspace-defaults.js", "dist/codex-workspace-defaults.js"),
     ("codex-ready.ts", "server/codex-ready.ts"),
+    ("voice-narration.ts", "server/voice-narration.ts"),
+    ("voice-narration.js", "dist/voice-narration.js"),
     ("deepseek-balance.ts", "server/deepseek-balance.ts"),
     ("deepseek-balance.js", "dist/deepseek-balance.js"),
 )
@@ -69,6 +73,7 @@ def _content_version(name: str) -> str:
         return hashlib.sha256(fh.read()).hexdigest()[:12]
 
 
+NARRATION_VERSION = _content_version("voice-narration.js")
 BALANCE_VERSION = _content_version("deepseek-balance.js")
 EXIT_REFUSED = 2
 # Touched whenever anything here changed: ovis.sh restarts a server older than it.
@@ -173,6 +178,8 @@ EDITS: list[tuple[str, str, list[tuple[str, str]]]] = [
             '    <meta charset="UTF-8" />\n'
             '    <!-- codex-workspace: the New workspace / New tab picker defaults to Codex (patches/ovis) -->\n'
             '    <script src="/codex-workspace-defaults.js"></script>\n'
+            '    <!-- codex-workspace: speak agent replies through voiceapi; before the app, to see its socket -->\n'
+            f'    <script src="/voice-narration.js?v={NARRATION_VERSION}"></script>\n'
             '    <!-- codex-workspace: the DeepSeek balance beside the composer model pill -->\n'
             f'    <script src="/deepseek-balance.js?v={BALANCE_VERSION}"></script>\n',
         )],
@@ -186,12 +193,21 @@ EDITS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 'HistoryChanged, paneConversation, paneProcessRoots, paneTranscript, toolOutput } from "./conversation.ts";\n',
                 'import { conversationImage, ConversationReadPending, ConversationUnavailable, forgetPaneTranscriptState, '
                 'HistoryChanged, paneConversation, paneProcessRoots, paneTranscript, toolOutput } from "./conversation.ts";\n'
+                '// codex-workspace: reply narration through voiceapi (patches/ovis/voice-narration.ts)\n'
+                'import { voiceNarrationRoute } from "./voice-narration.ts";\n'
                 '// codex-workspace: the DeepSeek balance for the composer pill (patches/ovis/deepseek-balance.ts)\n'
                 'import { deepseekBalanceRoute, BALANCE_PATH } from "./deepseek-balance.ts";\n',
             ),
             (
                 '  if (pathname === "/api/pane/conversation") {\n',
-                '  // codex-workspace: the DeepSeek balance for the composer pill (patches/ovis)\n'
+                '  // codex-workspace: /api/narration/* lists reply segments and streams their speech (patches/ovis)\n'
+                '  if (pathname.startsWith("/api/narration/")) {\n'
+                '    setRequestRoute(pathname);\n'
+                '    return voiceNarrationRoute(pathname, url, request, {\n'
+                '      readConversation: (paneId) => paneConversation(paneId, options.codexHome, {}, '
+                'options.devinDbPath, options.opencodeDb, options.hermesHome, options.grokHome, options.museData),\n'
+                '    });\n'
+                '  }\n'
                 '  if (pathname === BALANCE_PATH) {\n'
                 '    setRequestRoute(pathname);\n'
                 '    return deepseekBalanceRoute(pathname, request);\n'
